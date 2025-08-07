@@ -1,0 +1,94 @@
+Assumptions:
+	•	Glucose supply is constant and evenly distributed across the grid.
+	•	At equilibrium, GSoa equals the sum of all normal cells’ glucose uptake when grid is fully occupied by normal cells.
+	•	Glucose uptake reflects energy efficiency → higher uptake → higher proliferation → higher fitness.
+	•	Normal cells have constant glucose uptake; tumor cell glucose uptake is positively correlated with karyotype fitness.
+
+Distinction Between Frontal and Temporal Lobe:
+	•	The only difference between the two simulations is glucose supply level (GSoa).
+Overall Model Description:
+
+The program will simulate tumor and normal cell growth on a two-dimensional plane. There is competitive interaction between tumor and normal cells, described by a Lotka-Volterra (LV) competition model. Intra-species competition (tumor-tumor and normal-normal) is also included.
+
+Program Logic:
+
+1. Configuration:
+	•	Read the configuration file (Config) in YAML format, which includes known parameters:
+	•	Grid size (N × N),
+	•	Initial normal cell proliferation rate Rc,
+	•	Initial tumor cell proliferation rate Rt,
+	•	Normal cell glucose uptake Cg,
+	•	Initial proportion of the grid occupied by normal cells m%,
+	•	Mis-segregation rate MSR.
+
+2. Karyotype Library:
+	•	Read the pre-defined karyotype file KaryoLib, a data.frame:
+	•	First column: karyotype string (e.g., “1.2.3”)
+	•	Second column: fitness value
+	•	Diploid karyotype has all 22 chromosomes with copy number = 2
+
+3. Initialization:
+	•	Build a N × N growth grid. Each grid cell can hold one biological cell.
+	•	Place a tumor cell with diploid karyotype at the center of the grid.
+	•	Randomly distribute normal cells according to m% on remaining grid space.
+	•	Create a Cells data.frame with 31 columns to store cell state:
+		1.	$X: x-coordinate
+		2.	$Y: y-coordinate
+		3-24: karyotype (22 columns)
+		25.	$f: fitness
+		26.	$r: proliferation rate
+		27.	$G: glucose uptake
+		28.	$Label: 0 = normal, 1 = tumor
+		29.	$DivisionTime: estimated division time
+		30.	$Time: time elapsed since last division
+		31.	$Status: 0 = dead, 1 = alive
+
+4. Parameter Computation:
+	•	Total glucose supply GSoa = N * N.
+	•	For each normal cell, assign a proliferation rate Rci drawn from Rc ± 5%.
+	•	Estimate division time: DNt = 24 * Rci, DTt = 24 * Rt for tumor cells.
+	•	For each cell, calculate growth rate r within a 5 × 5 local neighborhood:
+	•	Tumor cell:
+DTti = (Rt * (Fk / Fd)) * (1 - ((Nt + a * Nn) / K))
+	•	Normal cell:
+DNtj = Rc * (1 - ((b * Nt + Nn) / K))
+Where:
+	•	K = N * N,
+	•	a = Cg / Tgk,
+	•	b = 1 / a,
+	•	Tgk = (Fk / Fd) * Tg,
+	•	Tg = 1.2 * Cg,
+	•	Fk: fitness of current cell karyotype,
+	•	Fd: fitness of diploid karyotype.
+If on the edge of the grid, use a virtual border filled with normal cells.
+
+5. Time-based Simulation:
+	•	Use time step deltaT = 1 hour, 24 steps = 1 day.
+	•	Sort Cells by $DivisionTime.
+	•	If $DivisionTime <= $Time, proceed with division (see section 6).
+	•	Check for cell death (see section 7).
+	•	Remove dead cells ($Status == 0).
+	•	At each loop, increment $Time by deltaT.
+	•	Save Cells as CSV every 24 steps (1 day).
+	•	Stop simulation when all grid cells are occupied.
+
+6. Cell Division:
+	•	A cell divides when $DivisionTime <= $Time.
+	•	Compute new $DivisionTime as:
+	•	Tumor: DTti = 24 * Rti
+	•	Normal: DNtj = 24 * Rcj
+	•	Check for neighboring empty grid to allow division.
+	•	Create a temporary data.frame Temp (2 rows × 31 columns) by copying the dividing cell’s data, with $Time reset to 0.
+	•	Mis-segregation (MS) Event:
+	•	Only tumor cells undergo MS events.
+	•	MS occurs with probability MSR (i.e., runif(1) < MSR).
+	•	If MS occurs: randomly change copy number in one of columns 3–24 (increase or decrease by 1, keeping values between 0–10).
+	•	Update $f by looking up KaryoLib.
+	•	Recalculate $r, using same formulas as in section 4.
+	•	Recompute $DivisionTime = 24 * r.
+	•	Replace original cell row with two rows in Cells.
+
+7. Cell Death:
+	•	A cell dies if its glucose supply G is ≤ 20% of its uptake.
+	•	Total available glucose is the sum of all $G values in Cells.
+	•	If G ≤ 0.2 * sum($G), set $Status = 0.

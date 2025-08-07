@@ -1,0 +1,8 @@
+Nd: 100          # grid
+Ctd: 5          # assumed tumor cells Glu absorbing rate over noralmal cells
+Rt: 0.02        # initial tumor cells growth rate
+Cg: 1.0         # Normal cell Glu absorbing
+m: 0.60         # Normal cell density (20%)
+MSR: 0.01       # MSR
+Mnr: 0.1
+Mtr: 0.5
