@@ -92,3 +92,67 @@ If on the edge of the grid, use a virtual border filled with normal cells.
 	•	A cell dies if its glucose supply G is ≤ 20% of its uptake.
 	•	Total available glucose is the sum of all $G values in Cells.
 	•	If G ≤ 0.2 * sum($G), set $Status = 0.
+
+
+=================================================================
+UPDATE – Version 2  (Aligned with GBM_abm.R dated 2025-08-07)
+=================================================================
+
+0.  NEW CONFIGURATION PARAMETERS
+    -------------------------------------------------------------
+      •  Rn                        – baseline proliferation rate for normal cells  
+      •  N_division_possibility    – probability that a normal cell becomes
+                                      division-eligible when a tumour neighbour is present  
+      •  N_death_rate / T_death_rate – per-day stochastic death probabilities
+                                      for normal vs tumour cells  
+      •  Mr                        – cell-specific migration probability
+                                      (Mnr for normal, Mtr for tumour)  
+      •  radius                    – half-width of the square neighbourhood
+                                      window (default = 2 ⇒ 5×5 window)
+
+1.  EXTRA COLUMNS IN THE “Cells” TABLE
+    -------------------------------------------------------------
+      division        0 = cannot divide, 1 = may divide  
+      Mr              migration probability per cell  
+      TimeToDivide    remaining hours until next division
+
+2.  NORMAL-CELL DIVISION ACTIVATION
+    -------------------------------------------------------------
+      – Executed every hour (function activate_normal_division).  
+      – If a live normal cell (division = 0) detects ≥ 1 tumour cell in its
+        5×5 window, it gains division = 1 with probability
+        N_division_possibility.  
+      – Without a tumour neighbour, it still has a background chance
+        N_division_possibility / 10.
+
+3.  REVISED DIVISION TRIGGER
+    -------------------------------------------------------------
+      A cell divides when:  
+        Status == 1  AND division == 1 AND TimeToDivide ≤ 0
+
+4.  UPDATED DEATH LOGIC
+    -------------------------------------------------------------
+      (a) Resource-limited:  G < 0.2 × avg_supply  
+      (b) Stochastic (once per day):  
+          tumour  dies if U ≤ T_death_rate  
+          normal dies if U ≤ N_death_rate  
+      (c) Division-timeout:  
+          division == 1 & |TimeToDivide| > 10 × DivisionTime
+
+5.  CELL MIGRATION
+    -------------------------------------------------------------
+      Each hour, a live cell moves to a random empty von-Neumann
+      neighbour with probability Mr. Grid indices and X/Y coordinates
+      are updated simultaneously.
+
+6.  HOURLY LOOP ORDER
+    -------------------------------------------------------------
+      1. activate_normal_division  
+      2. advance clocks (Time, TimeToDivide)  
+      3. divide eligible cells  
+      4. recalculate growth rates  
+      5. death_update  
+      6. migrate_cells  
+      7. snapshot every 24 steps
+
+This addendum updates the description so it matches the current R implementation.
