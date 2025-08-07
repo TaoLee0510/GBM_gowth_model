@@ -29,9 +29,14 @@ read_config <- function(path) {
   cfg_raw$N <- as.numeric(cfg_raw$Nd)
   cfg_raw$Ctd  <- as.numeric(cfg_raw$Ctd)
   cfg_raw$Rt  <- as.numeric(cfg_raw$Rt)
+  cfg_raw$Rn  <- as.numeric(cfg_raw$Rn)
+  cfg_raw$N_division_possibility  <- as.numeric(cfg_raw$N_division_possibility)
   cfg_raw$Cg  <- as.numeric(cfg_raw$Cg)
   cfg_raw$m   <- as.numeric(cfg_raw$m)
+  cfg_raw$N_death_rate   <- as.numeric(cfg_raw$N_death_rate)
+  cfg_raw$T_death_rate   <- as.numeric(cfg_raw$T_death_rate)
   cfg_raw$MSR <- as.numeric(cfg_raw$MSR)
+  cfg_raw$radius <- as.numeric(cfg_raw$radius)
   return(cfg_raw)
 }
 
@@ -96,11 +101,13 @@ init_cells <- function(cfg, karyolib) {
     row <- make_row(sel[i, 1], sel[i, 2], diploid, 0L,
                     1 ,1, cfg$Mnr)
     row$TimeToDivide<-NA
-    row$r<-NA
+    row$r<-runif(1, min = 0.95 * cfg$Rn, max = 1.05 * cfg$Rn)
     row$DivisionTime<-NA
     Cells <- bind_rows(Cells, row)
     grid[row$X, row$Y] <- nrow(Cells)
   }
+  # Initialize division flag: tumour cells can divide (division=1), normal cells cannot (division=0)
+  Cells$division <- ifelse(Cells$Label == 1L, 1L, 0L)
   list(Cells = Cells, grid = grid)
 }
 
@@ -108,7 +115,7 @@ init_cells <- function(cfg, karyolib) {
 #                   LOCAL NEIGHBOURHOOD QUANTITIES
 # -------------------------------------------------------------------------
 
-get_neighbour_counts <- function(Cells, grid, idx, radius = 2) {
+get_neighbour_counts <- function(Cells, grid, idx, radius) {
   N    <- nrow(grid)
   pos  <- which(grid == idx, arr.ind = TRUE)[1, ]
   if (length(pos) == 0) return(list(Nt = 0, Nn = 0))
@@ -129,9 +136,15 @@ get_neighbour_counts <- function(Cells, grid, idx, radius = 2) {
 #                         GROWTH‑RATE FUNCTION
 # -------------------------------------------------------------------------
 
-calc_rate <- function(Cells, grid, idx, cfg) {
-  N          <- cfg$N * cfg$N           # carrying capacity proxy
-  counts     <- get_neighbour_counts(Cells, grid, idx)
+calc_rate <- function(Cells, grid, idx, cfg, radius) {
+  # Local carrying capacity: size of radius-2 neighborhood window
+  pos      <- which(grid == idx, arr.ind = TRUE)[1, ]
+  xmin     <- max(1, pos[1] - radius)
+  xmax     <- min(nrow(grid), pos[1] + radius)
+  ymin     <- max(1, pos[2] - radius)
+  ymax     <- min(ncol(grid), pos[2] + radius)
+  capacity <- (xmax - xmin + 1) * (ymax - ymin + 1)
+  counts   <- get_neighbour_counts(Cells, grid, idx, cfg$radius)
   Nt <- counts$Nt; Nn <- counts$Nn
   
   a <- cfg$Cg / (((Cells$f[idx]) / cfg$Fd) * cfg$Tg)
@@ -139,14 +152,14 @@ calc_rate <- function(Cells, grid, idx, cfg) {
   
   if (Cells$Label[idx] == 1L) {
     # tumour
-    r <- (cfg$Rt * (Cells$f[idx] / cfg$Fd)) * (1 - ((Nt + a * Nn) / N))
+    r <- (cfg$Rt * (Cells$f[idx] / cfg$Fd)) * (1 - ((Nt + a * Nn) / capacity))
   } else {
     # normal
-    r <- cfg$Rt * (1 - ((b * Nt + Nn) / N))
+    r <- cfg$Rt * (1 - ((b * Nt + Nn) / capacity))
   }
-  if(r <=0)# mark negative r as dead
+  if(r <= 0)# mark negative r as dead
   {
-    Cells$Status[idx] == 0L
+    Cells$Status[idx] <- 0L
   }
   return(r)
 }
@@ -218,6 +231,11 @@ divide_cell <- function(Cells, grid, idx, cfg, karyolib) {
   # 5. Recompute growth rate r and DivisionTime for both daughters
   Cells$DivisionTime[idx]    <- 1 / Cells$r[idx]
   Cells$DivisionTime[new_idx] <- 1 / Cells$r[new_idx]
+
+  # Noraml cells cannot divide immediately
+  if(Cells$Label[i] == 0L){
+    Cells$division <- 0L
+  }
   
   return(list(Cells = Cells, grid = grid))
 }
@@ -225,7 +243,7 @@ divide_cell <- function(Cells, grid, idx, cfg, karyolib) {
 #                             DEATH CHECK
 # -------------------------------------------------------------------------
 
-death_update <- function(Cells, grid, cfg) {
+death_update <- function(Cells, grid, cfg, step) {
   # 1. Compute total supply and average per-unit-G supply
   N            <- cfg$N
   total_supply <- 1 * N * N
@@ -242,6 +260,23 @@ death_update <- function(Cells, grid, cfg) {
   
   # 2. Identify cells with G below threshold
   dead_idx <- which(Cells$G < death_thr)
+  # Random death logic: normal cells use N_death_rate, tumour cells use T_death_rate
+  rand_vals <- runif(nrow(Cells))
+  if (step %% 24L == 0L)
+  {
+    rand_dead <- which(
+    (Cells$Label == 1L & rand_vals <= cfg$T_death_rate) |
+    (Cells$Label == 0L & rand_vals <= cfg$N_death_rate)
+  )
+   dead_idx <- unique(c(dead_idx, rand_dead))
+  }
+  
+  # Additional death rule: if division==1 and abs(TimeToDivide) > 10 * DivisionTime, mark as dead
+  div_delay_dead <- which(
+    Cells$division == 1L &
+    abs(Cells$TimeToDivide) > 10 * Cells$DivisionTime
+  )
+  dead_idx <- unique(c(dead_idx, div_delay_dead))
   
   if (length(dead_idx) > 0) {
     # Mark them dead
@@ -271,6 +306,7 @@ death_update <- function(Cells, grid, cfg) {
 # -------------------------------------------------------------------------
 #                             MIGRATION
 # -------------------------------------------------------------------------
+
 
 migrate_cells <- function(Cells, grid, cfg) {
   N <- cfg$N
@@ -306,12 +342,35 @@ migrate_cells <- function(Cells, grid, cfg) {
   list(Cells = Cells, grid = grid)
 }
 
+# Helper: activate normal cell division eligibility
+activate_normal_division <- function(Cells, grid, cfg) {
+  norm_idxs <- which(Cells$Status == 1L & Cells$Label == 0L & Cells$division == 0L)
+  for (i in norm_idxs) {
+    nb_counts <- get_neighbour_counts(Cells, grid, i, cfg$radius)
+    # if tumour neighbor exists and random chance allows division
+    if (nb_counts$Nt > 0 && runif(1) <= cfg$N_division_possibility) {
+      Cells$division[i]     <- 1L
+      Cells$Time[i]         <- 0L
+      Cells$TimeToDivide[i] <- 0L
+      Cells$DivisionTime[i] <- 1 / Cells$r[i]
+    }
+    # if no tumour neighbor and lower chance allows division
+    if (nb_counts$Nt == 0 && runif(1) <= (cfg$N_division_possibility / 10)) {
+      Cells$division[i]     <- 1L
+      Cells$Time[i]         <- 0L
+      Cells$TimeToDivide[i] <- 0L
+      Cells$DivisionTime[i] <- 1 / Cells$r[i]
+    }
+  }
+  Cells
+}
+
 
 # -------------------------------------------------------------------------
 #                          MAIN SIMULATION LOOP
 # -------------------------------------------------------------------------
 
-run_simulation <- function(cfg_file, karyolib_file, prefix = "Cells") {
+run_simulation <- function(cfg_file, karyolib_file, outputdir, prefix = "Cells") {
   cfg         <- read_config(cfg_file)
   karyolib    <- read_karyolib(karyolib_file)
   cfg$Fd      <- karyolib$fitness[match(kt_vec2str(rep(2L, 22)), karyolib$karyotype)]
@@ -323,36 +382,48 @@ run_simulation <- function(cfg_file, karyolib_file, prefix = "Cells") {
   
   step        <- 0L
   day_index   <- 0L
-  write.csv(Cells, sprintf("./Results/%s_day%03d.csv", prefix, day_index), row.names = FALSE)
+  write.csv(Cells, sprintf(paste0(outputdir,"/Results/%s_day%03d.csv"), prefix, day_index), row.names = FALSE)
   cat("Day", day_index, ":", nrow(Cells), "living cells saved\n")
   repeat {
     step <- step + 1L
-    
+
+    # Activate normal cell division
+    Cells <- activate_normal_division(Cells, grid, cfg)
+
     # advance internal clocks -------------------------------------------
     Cells$Time <- Cells$Time + 1
     Cells$TimeToDivide<-Cells$DivisionTime-Cells$Time
     # identify cells ready to divide using TimeToDivide <= 0 and Status == 1
-    to_divide_idx <- which(Cells$Status == 1L & Cells$TimeToDivide <= 0 & Cells$Label ==1L)
+    to_divide_idx <- which(Cells$Status == 1L & Cells$TimeToDivide <= 0 & Cells$division == 1L)
     for (idx in to_divide_idx) {
       res <- divide_cell(Cells, grid, idx, cfg, karyolib)
       Cells <- res$Cells; grid <- res$grid
     }
     for (idx in 1:nrow(Cells))
     {
-        Cells$r[idx] <- calc_rate(Cells, grid, idx, cfg)
+        Cells$r[idx] <- calc_rate(Cells, grid, idx, cfg, cfg$radius)
     }
     # death --------------------------------------------------------------
-    res <- death_update(Cells, grid, cfg)
-    Cells <- res$Cells; grid <- res$grid
+    res <- death_update(Cells, grid, cfg, step)
+    Cells <- res$Cells
+    grid <- res$grid
     # migration------------------------------------------------------------
     mig <- migrate_cells(Cells, grid, cfg)
     Cells <- mig$Cells
     grid  <- mig$grid
     
+    # update growth rates r ----------------------------------------------
+    # Recalculate growth rates for all cells
+    # This is done after migration
+    for (idx in 1:nrow(Cells))
+    {
+        Cells$r[idx] <- calc_rate(Cells, grid, idx, cfg, cfg$radius)
+    }
+
     # daily snapshot -----------------------------------------------------
     if (step %% 24L == 0L) {
       day_index <- day_index + 1L
-      write.csv(Cells, sprintf("./Results/%s_day%03d.csv", prefix, day_index), row.names = FALSE)
+      write.csv(Cells, sprintf(paste0(outputdir,"/Results/%s_day%03d.csv"), prefix, day_index), row.names = FALSE)
       cat("Day", day_index, ":", nrow(Cells), "living cells saved\n")
     }
     
@@ -372,4 +443,4 @@ run_simulation <- function(cfg_file, karyolib_file, prefix = "Cells") {
 # Uncomment to run with your own paths ------------------------------------
 # result <- run_simulation("config.yaml", "karyolib.csv")
 
-result <- run_simulation('/Volumes/Protable Disk/HIP-IMO/config.yaml', '/Volumes/Protable Disk/HIP-IMO/TEMPORAL_landscape_summary.csv')
+result <- run_simulation('/Users/4482173/Library/CloudStorage/OneDrive-MoffittCancerCenter/GitHub/GBM_gowth_model/config.yaml', '/Users/4482173/Library/CloudStorage/OneDrive-MoffittCancerCenter/GitHub/GBM_gowth_model/TEMPORAL_landscape_summary.csv',"/Users/4482173/Documents/Project/GBM_Model")
