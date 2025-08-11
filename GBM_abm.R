@@ -37,6 +37,11 @@ read_config <- function(path) {
   cfg_raw$T_death_rate   <- as.numeric(cfg_raw$T_death_rate)
   cfg_raw$MSR <- as.numeric(cfg_raw$MSR)
   cfg_raw$radius <- as.numeric(cfg_raw$radius)
+  cfg_raw$total_supply <- as.numeric(cfg_raw$total_supply)
+  # Fallback: if total_supply is missing/NA, default to N*N
+  if (is.na(cfg_raw$total_supply)) {
+    cfg_raw$total_supply <- cfg_raw$N * cfg_raw$N
+  }
   return(cfg_raw)
 }
 
@@ -155,7 +160,7 @@ calc_rate <- function(Cells, grid, idx, cfg, radius) {
     r <- (cfg$Rt * (Cells$f[idx] / cfg$Fd)) * (1 - ((Nt + a * Nn) / capacity))
   } else {
     # normal
-    r <- cfg$Rt * (1 - ((b * Nt + Nn) / capacity))
+    r <- cfg$Rn * (1 - ((b * Nt + Nn) / capacity))
   }
   if(r <= 0)# mark negative r as dead
   {
@@ -174,13 +179,17 @@ divide_cell <- function(Cells, grid, idx, cfg, karyolib) {
     return(list(Cells = Cells, grid = grid))
   }
   
-  # 1. Find mother cell position and its free von Neumann neighbors
+  # 1. Find mother cell position and its free Moore neighbors (8‑neighbourhood)
   pos <- which(grid == idx, arr.ind = TRUE)[1, ]
   nbr <- rbind(
-    c(pos[1] - 1, pos[2]),  # up
-    c(pos[1] + 1, pos[2]),  # down
+    c(pos[1] - 1, pos[2]    ),  # up
+    c(pos[1] + 1, pos[2]    ),  # down
     c(pos[1],     pos[2] - 1),  # left
-    c(pos[1],     pos[2] + 1)   # right
+    c(pos[1],     pos[2] + 1),  # right
+    c(pos[1] - 1, pos[2] - 1),  # up-left
+    c(pos[1] - 1, pos[2] + 1),  # up-right
+    c(pos[1] + 1, pos[2] - 1),  # down-left
+    c(pos[1] + 1, pos[2] + 1)   # down-right
   )
   valid    <- nbr[,1] >= 1 & nbr[,1] <= cfg$N &
     nbr[,2] >= 1 & nbr[,2] <= cfg$N
@@ -196,23 +205,65 @@ divide_cell <- function(Cells, grid, idx, cfg, karyolib) {
   daughters$Time <- 0L
   
   # 3. Assign karyotype, fitness and resource for each daughter
-    speed_ratio <- cfg$Ctd
-    for (i in 1:2) {
+  speed_ratio <- cfg$Ctd
+
+  # Mother karyotype as integer vector
+  mother_kt <- as.integer(mother[paste0("K", 1:22)])
+
+  # Initialize daughters as faithful copies (no-MS baseline)
+  kt1 <- mother_kt
+  kt2 <- mother_kt
+  f1  <- mother$f
+  f2  <- mother$f
+
+  # Apply MSR only for tumour cells; decide occurrence via Poisson(MSR)
+  # Draw the number of mis-segregation events from Poisson with mean cfg$MSR.
+  # We only care about occurrence (>=1) here.
+  ms_count <- rpois(1, lambda = cfg$MSR)
+  if (Cells$Label[idx] == 1L && ms_count >= 1L) {
+    # Try to find a valid mis-segregation that yields two karyotypes
+    # both present in the karyotype library. Enforce sum conservation:
+    # for each selected chromosome, randomly assign direction.
+    valid_chr <- which(mother_kt >= 1 & mother_kt <= 9)  # need room for -1/+1
+    attempts <- 0L
+    if (length(valid_chr) > 0 && ms_count <= length(valid_chr)) {
       repeat {
-        kt    <- as.integer(mother[paste0("K", 1:22)])
-        chr   <- sample(1:22, 1)
-        delta <- sample(c(-1,1), 1)
-        kt[chr] <- pmin(pmax(kt[chr] + delta, 0), 10)
-        f_new   <- fitness_of(karyolib, kt)
-        if (!is.na(f_new)) break
+        attempts <- attempts + 1L
+        sel <- sample(valid_chr, ms_count)
+        kt1 <- mother_kt; kt2 <- mother_kt
+        for (i_chr in sel) {
+          if (runif(1) < 0.5) {
+            # daughter1 loses one copy, daughter2 gains one copy
+            kt1[i_chr] <- mother_kt[i_chr] - 1L
+            kt2[i_chr] <- mother_kt[i_chr] + 1L
+          } else {
+            # daughter1 gains one copy, daughter2 loses one copy
+            kt1[i_chr] <- mother_kt[i_chr] + 1L
+            kt2[i_chr] <- mother_kt[i_chr] - 1L
+          }
+        }
+        f1 <- fitness_of(karyolib, kt1)
+        f2 <- fitness_of(karyolib, kt2)
+        if (!is.na(f1) && !is.na(f2)) break
+        if (attempts >= 200L) {
+          # Fallback: abort MS event if no valid pair found after many tries
+          kt1 <- mother_kt; kt2 <- mother_kt
+          f1  <- mother$f;  f2  <- mother$f
+          break
+        }
       }
-      # write validated karyotype and fitness
-      for (j in 1:22) {
-        daughters[i, paste0("K", j)] <- kt[j]
-      }
-      daughters$f[i] <- f_new
-      daughters$G[i] <- speed_ratio * f_new
+    }
   }
+
+  # Write daughter karyotypes and fitness, then compute G
+  for (j in 1:22) {
+    daughters[1, paste0("K", j)] <- kt1[j]
+    daughters[2, paste0("K", j)] <- kt2[j]
+  }
+  daughters$f[1] <- f1
+  daughters$f[2] <- f2
+  daughters$G[1] <- speed_ratio * f1
+  daughters$G[2] <- speed_ratio * f2
   
   # 4. Place daughters into Cells & grid
   # overwrite mother with first daughter
@@ -233,20 +284,22 @@ divide_cell <- function(Cells, grid, idx, cfg, karyolib) {
   Cells$DivisionTime[new_idx] <- 1 / Cells$r[new_idx]
 
   # Noraml cells cannot divide immediately
-  if(Cells$Label[i] == 0L){
-    Cells$division <- 0L
-  }
+ if (Cells$Label[idx] == 0L) {
+  Cells$division[idx]     <- 0L
+  Cells$division[new_idx] <- 0L
+}
   
   return(list(Cells = Cells, grid = grid))
 }
+#
 # -------------------------------------------------------------------------
 #                             DEATH CHECK
+#   - total_supply is now read from YAML config (with fallback)
 # -------------------------------------------------------------------------
 
 death_update <- function(Cells, grid, cfg, step) {
   # 1. Compute total supply and average per-unit-G supply
-  N            <- cfg$N
-  total_supply <- 1 * N * N
+  total_supply <- if (!is.null(cfg$total_supply)) cfg$total_supply else (cfg$N * cfg$N)
   total_G      <- sum(Cells$G)
   
   # Avoid division by zero
@@ -274,7 +327,7 @@ death_update <- function(Cells, grid, cfg, step) {
   # Additional death rule: if division==1 and abs(TimeToDivide) > 10 * DivisionTime, mark as dead
   div_delay_dead <- which(
     Cells$division == 1L &
-    abs(Cells$TimeToDivide) > 10 * Cells$DivisionTime
+    abs(Cells$TimeToDivide) > 5 * Cells$DivisionTime
   )
   dead_idx <- unique(c(dead_idx, div_delay_dead))
   
@@ -314,13 +367,17 @@ migrate_cells <- function(Cells, grid, cfg) {
     if (Cells$Status[i] != 1L) next
     # decide whether to move
     if (runif(1) < Cells$Mr[i]) {
-      # find von Neumann neighbours
+      # find Moore neighbors (8‑neighbourhood)
       pos <- c(Cells$X[i], Cells$Y[i])
       nbr <- rbind(
-        pos + c(-1,  0),
-        pos + c( 1,  0),
-        pos + c( 0, -1),
-        pos + c( 0,  1)
+        pos + c(-1,  0),  # up
+        pos + c( 1,  0),  # down
+        pos + c( 0, -1),  # left
+        pos + c( 0,  1),  # right
+        pos + c(-1, -1),  # up-left
+        pos + c(-1,  1),  # up-right
+        pos + c( 1, -1),  # down-left
+        pos + c( 1,  1)   # down-right
       )
       # filter valid coords
       valid <- nbr[,1] >= 1 & nbr[,1] <= N &
@@ -423,7 +480,26 @@ run_simulation <- function(cfg_file, karyolib_file, outputdir, prefix = "Cells")
     # daily snapshot -----------------------------------------------------
     if (step %% 24L == 0L) {
       day_index <- day_index + 1L
-      write.csv(Cells, sprintf(paste0(outputdir,"/Results/%s_day%03d.csv"), prefix, day_index), row.names = FALSE)
+      # Build file paths once
+      csv_path <- sprintf(paste0(outputdir, "/Results/%s_day%03d.csv"), prefix, day_index)
+      png_path <- sub("\\.csv$", ".png", csv_path)
+
+      # Save CSV snapshot
+      write.csv(Cells, csv_path, row.names = FALSE)
+
+      # Prepare colours: tumour (Label==1) red, normal (Label==0) green
+      cols <- ifelse(Cells$Label == 1L, "red", "green")
+
+      # Draw PNG scatter (no axes), fixed limits 1..100
+      png(filename = png_path, width = 500, height = 500, units = "px")
+      op <- par(mar = c(0, 0, 0, 0))
+      plot(Cells$X, Cells$Y,
+           col = cols, pch = 16,
+           xlim = c(1, 100), ylim = c(1, 100),
+           axes = FALSE, xlab = "", ylab = "", asp = 1)
+      par(op)
+      dev.off()
+
       cat("Day", day_index, ":", nrow(Cells), "living cells saved\n")
     }
     
@@ -443,4 +519,4 @@ run_simulation <- function(cfg_file, karyolib_file, outputdir, prefix = "Cells")
 # Uncomment to run with your own paths ------------------------------------
 # result <- run_simulation("config.yaml", "karyolib.csv")
 
-result <- run_simulation('/Users/4482173/Library/CloudStorage/OneDrive-MoffittCancerCenter/GitHub/GBM_gowth_model/config.yaml', '/Users/4482173/Library/CloudStorage/OneDrive-MoffittCancerCenter/GitHub/GBM_gowth_model/TEMPORAL_landscape_summary.csv',"/Users/4482173/Documents/Project/GBM_Model")
+result <- run_simulation('/Users/4482173/Library/CloudStorage/OneDrive-MoffittCancerCenter/GitHub/GBM_gowth_model/config.yaml', '/Users/4482173/Library/CloudStorage/OneDrive-MoffittCancerCenter/GitHub/GBM_gowth_model/merged_mean.csv',"/Users/4482173/Documents/Project/GBM_Model")
