@@ -325,9 +325,10 @@ run_simulation <- function(cfg_file, karyolib_file, outputdir, prefix = "Cells")
 }
 
 # Helper function: run simulation with parsed cfg and karyolib directly
-run_simulation_cfg <- function(cfg, karyolib, outputdir, prefix = "Cells") {
+run_simulation_cfg <- function(cfg, karyolib, outputdir, prefix = "Cells", global_id = NA_integer_) {
   init        <- init_cells(cfg, karyolib)
   Cells       <- init$Cells
+  Cells$global_id <- as.integer(global_id)
   grid        <- init$grid
   id_state    <- list(max_id = init$max_id)
 
@@ -407,6 +408,7 @@ run_simulation_cfg <- function(cfg, karyolib, outputdir, prefix = "Cells") {
       TimeToDivide = as.numeric(res$TimeToDivide),
       division = as.integer(res$division)
     )
+    Cells$global_id <- as.integer(global_id)
 
     # Write K columns back to the data frame
     K_mat <- res$K
@@ -470,10 +472,11 @@ run_ABM_simulation <- function(cfg_file, karyolib_file, base_output, workers = m
   supplies <- cfg0$total_supply_vec
   reps <- cfg0$replicates
 
-  # Prepare all jobs (supply x replicate)
+  # Prepare all jobs (supply x replicate) with simulation index reset per supply
   jobs <- list()
   for (s in supplies) {
     supply_label <- format(signif(s / (cfg0$N * cfg0$N), 6), trim = TRUE)
+    # reset counter per supply
     for (r in seq_len(reps)) {
       out_dir <- file.path(base_output, "Results", supply_label, sprintf("Sim_%03d", r))
       cfg_i <- cfg0
@@ -483,9 +486,26 @@ run_ABM_simulation <- function(cfg_file, karyolib_file, base_output, workers = m
         out_dir = out_dir,
         prefix = sprintf("Cells_supply_%s_rep%03d", gsub("[^0-9.]", "", supply_label), r),
         cfg_path = cfg_file,
-        karyolib_path = karyolib_file
+        karyolib_path = karyolib_file,
+        global_id = as.integer(r)  # within-supply replicate id (001..reps)
       )
     }
+  }
+
+  # Create a manifest to verify mapping (supply x replicate -> folder/prefix)
+  results_root <- file.path(base_output, "Results")
+  dir.create(results_root, recursive = TRUE, showWarnings = FALSE)
+  if (length(jobs) > 0) {
+    manifest <- tibble::tibble(
+      supply_value = vapply(jobs, function(j) j$cfg$total_supply, numeric(1)),
+      supply_ratio = vapply(jobs, function(j) j$cfg$total_supply / (cfg0$N * cfg0$N), numeric(1)),
+      supply_label = vapply(jobs, function(j) basename(dirname(j$out_dir)), character(1)),
+      replicate    = vapply(jobs, function(j) as.integer(j$global_id), integer(1)),
+      global_id    = vapply(jobs, function(j) as.integer(j$global_id), integer(1)),
+      out_dir      = vapply(jobs, function(j) j$out_dir, character(1)),
+      prefix       = vapply(jobs, function(j) j$prefix, character(1))
+    )
+    write.csv(manifest, file.path(results_root, "manifest.csv"), row.names = FALSE)
   }
 
   # Run in parallel, avoiding global serialization and reloading code/kernels in each worker
@@ -508,10 +528,29 @@ run_ABM_simulation <- function(cfg_file, karyolib_file, base_output, workers = m
       cfg_i <- job$cfg
       cfg_i$Fd <- karyolib$fitness[match(kt_vec2str(rep(2L, 22)), karyolib$karyotype)]
       cfg_i$Tg <- 1.2 * cfg_i$Cg
-      # Ensure output directory exists
+
+      # Log which supply/replicate this worker is running
+      ratio_str <- format(signif(cfg_i$total_supply / (cfg_i$N * cfg_i$N), 6), trim = TRUE)
+      cat(sprintf("[RUN] supply_ratio=%s, replicate=%s -> %s\n",
+                  ratio_str,
+                  sprintf("%03d", as.integer(job$global_id)),
+                  job$out_dir))
+
+      # Ensure output directory exists and drop a small job_info file for auditing
       dir.create(job$out_dir, recursive = TRUE, showWarnings = FALSE)
+      write.csv(
+        data.frame(
+          supply_value = cfg_i$total_supply,
+          supply_ratio = as.numeric(cfg_i$total_supply) / (cfg_i$N * cfg_i$N),
+          replicate    = as.integer(job$global_id),
+          global_id    = as.integer(job$global_id),
+          prefix       = job$prefix
+        ),
+        file = file.path(job$out_dir, "job_info.csv"), row.names = FALSE
+      )
+
       # Run single simulation
-      run_simulation_cfg(cfg_i, karyolib, job$out_dir, prefix = job$prefix)
+      run_simulation_cfg(cfg_i, karyolib, job$out_dir, prefix = job$prefix, global_id = job$global_id)
       invisible(TRUE)
     },
     future.globals = FALSE,
