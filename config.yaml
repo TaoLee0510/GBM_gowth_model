@@ -5,7 +5,7 @@ Rn: 0.04                       # normal cells growth rate
 N_division_possibility: 0.001  # Normal cell division possibility(every 1 hour) 
 Cg: 1.0                        # Normal cell Glu absorbing
 m: 0.60                        # Normal cell density
-N_death_rate: 0.005            # Normal cell death rate(every 24 hours) 
+N_death_rate: 0.0002            # Normal cell death rate(every 24 hours) 
 T_death_rate: 0.002            # Normal cell death rate(every 24 hours) 
 MSR: 1.1                       # MSR 0.025 * 44
 Mnr: 0.0005                       # Migration normal cells rate
@@ -13,8 +13,8 @@ Mtr: 0.0025                       # Migration tumor cells rate
 radius: 2                      # radius
 total_supply: "0.1,0.25,0.5,1,2"                   # total supply of Glu
 DTr: 0.2                      # tumor cells Glu death proportion
-DNr: 0.05                      # normal cells Glu death proportion
-replicates: 5                  # number of replicates
+DNr: 0.02                      # normal cells Glu death proportion
+replicates: 10                  # number of replicates
 
 
 
