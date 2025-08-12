@@ -1,522 +1,560 @@
-# GBM Agent‑Based Model Simulation in a 2‑D lattice
+# GBM Agent-Based Model Simulation on a 2-D Lattice
 # -------------------------------------------------
-# This script implements an agent‑based model (ABM) for the growth of
-# glioblastoma (GBM) tumours in two distinct brain regions (e.g., frontal
-# and temporal lobes).  Each grid cell hosts at most one biological cell
-# (tumour or normal).  Key processes implemented:
-#   • Initial placement of one tumour cell at the centre and a user‑defined
-#     fraction of normal cells elsewhere.
-#   • Cell‑specific growth‑rate calculation that incorporates karyotype‑
-#     dependent fitness and Lotka–Volterra–type competition with neighbours.
-#   • Stochastic cell division with optional chromosome mis‑segregation.
-#   • Glucose‑limited death.
-#   • Hourly time steps (Δt = 1 h); grids are written to CSV once per day.
-#
-# External dependencies ---------------------------------------------------
-# install.packages(c("yaml","dplyr","tibble","stringr","purrr"))
+# This script implements an agent-based model (ABM) for glioblastoma (GBM)
+# on an N×N grid. It now uses:
+#   • Stable IDs in the grid (no row-index remapping on death).
+#   • Bulk growth-rate computation via calc_rates_all_cpp (Rcpp).
 
 library(yaml)
 library(dplyr)
 library(tibble)
 library(stringr)
+library(Rcpp)
+library(future.apply)
 
-# -------------------------------------------------------------------------
-#                               I/O HELPERS
-# -------------------------------------------------------------------------
+
+# Avoid serializing external pointers and reloading on workers
+if (isFALSE(getOption("GBM_ABM_CPP_LOADED", FALSE))) {
+  Rcpp::sourceCpp("src/abm_kernels.cpp", rebuild = FALSE, verbose = FALSE)
+  options(GBM_ABM_CPP_LOADED = TRUE)
+}
+
+# Small helper: null coalescing operator
+"%||%" <- function(a,b) if (is.null(a)) b else a
+# ------------------------------- I/O ------------------------------------
 
 read_config <- function(path) {
   cfg_raw <- yaml::read_yaml(path)
-  cfg_raw$N <- as.numeric(cfg_raw$Nd)
+  cfg_raw$N  <- as.numeric(cfg_raw$Nd)
   cfg_raw$Ctd  <- as.numeric(cfg_raw$Ctd)
-  cfg_raw$Rt  <- as.numeric(cfg_raw$Rt)
-  cfg_raw$Rn  <- as.numeric(cfg_raw$Rn)
-  cfg_raw$N_division_possibility  <- as.numeric(cfg_raw$N_division_possibility)
+  cfg_raw$Rt   <- as.numeric(cfg_raw$Rt)
+  cfg_raw$Rn   <- as.numeric(cfg_raw$Rn)
+  cfg_raw$N_division_possibility <- as.numeric(cfg_raw$N_division_possibility)
   cfg_raw$Cg  <- as.numeric(cfg_raw$Cg)
   cfg_raw$m   <- as.numeric(cfg_raw$m)
-  cfg_raw$N_death_rate   <- as.numeric(cfg_raw$N_death_rate)
-  cfg_raw$T_death_rate   <- as.numeric(cfg_raw$T_death_rate)
+  cfg_raw$N_death_rate <- as.numeric(cfg_raw$N_death_rate)
+  cfg_raw$T_death_rate <- as.numeric(cfg_raw$T_death_rate)
   cfg_raw$MSR <- as.numeric(cfg_raw$MSR)
   cfg_raw$radius <- as.numeric(cfg_raw$radius)
-  cfg_raw$total_supply <- as.numeric(cfg_raw$total_supply)
-  # Fallback: if total_supply is missing/NA, default to N*N
-  if (is.na(cfg_raw$total_supply)) {
-    cfg_raw$total_supply <- cfg_raw$N * cfg_raw$N
+  # Parse total_supply as vector: accept numeric, YAML seq, or comma-separated string
+  ts_raw <- cfg_raw$total_supply
+  if (is.null(ts_raw)) {
+    ts_vec <- cfg_raw$N * cfg_raw$N
+  } else if (is.numeric(ts_raw) && length(ts_raw) > 1) {
+    ts_vec <- as.numeric(ts_raw)
+  } else if (is.character(ts_raw) && length(ts_raw) == 1 && grepl(",", ts_raw)) {
+    parts <- strsplit(ts_raw, ",")[[1]]
+    ts_vec <- as.numeric(trimws(parts))
+  } else {
+    ts_vec <- as.numeric(ts_raw)
   }
+  ts_vec <- ts_vec * (cfg_raw$N * cfg_raw$N)
+  cfg_raw$total_supply_vec <- ts_vec
+  # For single-run functions, default to the first value
+  cfg_raw$total_supply <- as.numeric(ts_vec[1])
+  cfg_raw$DTr <- as.numeric(cfg_raw$DTr)
+  cfg_raw$DNr <- as.numeric(cfg_raw$DNr)
+  if (is.na(cfg_raw$total_supply)) cfg_raw$total_supply <- cfg_raw$N * cfg_raw$N
+  if (is.na(cfg_raw$DTr)) cfg_raw$DTr <- 0.2
+  if (is.na(cfg_raw$DNr)) cfg_raw$DNr <- 0.2
+  # Replicates from YAML (default 1)
+  cfg_raw$replicates <- as.integer(cfg_raw$replicates %||% 1L)
+  if (is.na(cfg_raw$replicates) || cfg_raw$replicates < 1L) cfg_raw$replicates <- 1L
   return(cfg_raw)
 }
 
 read_karyolib <- function(path) {
-  # Expected: first column =karyotype string (e.g. "2.2.2…"), second = fitness
   kdf <- read.csv(path, stringsAsFactors = FALSE)
   names(kdf)[1:2] <- c("karyotype", "fitness")
-  return(kdf)
+  kdf
 }
 
 kt_vec2str <- function(v) paste(v, collapse = ".")
-kt_str2vec <- function(s) as.integer(str_split(s, "\\.")[[1]])
-
 fitness_of <- function(karyolib, v) {
   s <- kt_vec2str(v)
   f <- karyolib$fitness[match(s, karyolib$karyotype)]
   if (is.na(f)) NA else f
 }
 
-# -------------------------------------------------------------------------
-#                           INITIALISATION
-# -------------------------------------------------------------------------
+# -------------------------- Initialisation ------------------------------
 
 init_cells <- function(cfg, karyolib) {
-  N   <- cfg$N                           # grid length
-  m   <- cfg$m                           # initial normal‑cell density (0‑1)
-  n_g <- N * N                           # total lattice sites
-  grid <- matrix(NA_integer_, nrow = N, ncol = N)  # stores row index of Cells
-  
+  N   <- cfg$N
+  m   <- cfg$m
+  n_g <- N * N
+  grid <- matrix(NA_integer_, nrow = N, ncol = N)  # stores stable IDs
+
   diploid <- rep(2L, 22)
   fit_dip <- fitness_of(karyolib, diploid)
-  
-  # Helper to build a cell row -------------------------------------------
-  make_row <- function(x, y, kt_vec, label, r_base,f, mr) {
+
+  # row constructor
+  make_row <- function(id, x, y, kt_vec, label, r_base, f, mr) {
     tibble(
+      id = id,
       X = x, Y = y,
       !!!setNames(as.list(kt_vec), paste0("K", 1:22)),
       f  = f,
-      r  = r_base,                      # will be updated later
-      G  = cfg$Cg,
-      Label = label,                   # 0 = normal, 1 = tumour
-      DivisionTime = (1 / r_base)/f,      # hours
-      Time = 0,                        # hours since last division
-      Status = 1L,                      # 1 = alive, 0 = dead
+      r  = r_base,
+      G  = cfg$Cg,            # tumour overwritten after f set
+      Label = label,          # 0=normal, 1=tumour
+      DivisionTime = NA_real_,
+      Time = 0,
+      Status = 1L,
       Mr  = mr,
-      TimeToDivide = 0
+      TimeToDivide = 0,
+      division = ifelse(label == 1L, 1L, 0L)
     )
   }
+
   speed_ratio <- cfg$Ctd
-  # 1. Single tumour cell in the centre ----------------------------------
-  centre <- c(ceiling(N / 2), ceiling(N / 2))
-  Cells  <- make_row(centre[1], centre[2], diploid, 1L, cfg$Rt,fit_dip,cfg$Mtr)
-  grid[centre[1], centre[2]] <- 1L
-  Cells$G<-speed_ratio * fit_dip
-  Cells$TimeToDivide<-Cells$DivisionTime-Cells$Time
-  
-  # 2. Random normal cells ------------------------------------------------
+  next_id <- 1L
+
+  # seed tumour at centre
+  centre <- c(ceiling(N/2), ceiling(N/2))
+  Cells  <- make_row(next_id, centre[1], centre[2], diploid, 1L, cfg$Rt, fit_dip, cfg$Mtr)
+  grid[centre[1], centre[2]] <- next_id
+  Cells$G[1] <- speed_ratio * fit_dip
+
+  # seed normals
   n_norm <- floor(n_g * m)
-  empty  <- which(is.na(grid), arr.ind = TRUE)
-  sel    <- empty[sample(seq_len(nrow(empty)), n_norm), , drop = FALSE]
-  for (i in seq_len(n_norm)) {
-    row <- make_row(sel[i, 1], sel[i, 2], diploid, 0L,
-                    1 ,1, cfg$Mnr)
-    row$TimeToDivide<-NA
-    row$r<-runif(1, min = 0.95 * cfg$Rn, max = 1.05 * cfg$Rn)
-    row$DivisionTime<-NA
-    Cells <- bind_rows(Cells, row)
-    grid[row$X, row$Y] <- nrow(Cells)
-  }
-  # Initialize division flag: tumour cells can divide (division=1), normal cells cannot (division=0)
-  Cells$division <- ifelse(Cells$Label == 1L, 1L, 0L)
-  list(Cells = Cells, grid = grid)
-}
-
-# -------------------------------------------------------------------------
-#                   LOCAL NEIGHBOURHOOD QUANTITIES
-# -------------------------------------------------------------------------
-
-get_neighbour_counts <- function(Cells, grid, idx, radius) {
-  N    <- nrow(grid)
-  pos  <- which(grid == idx, arr.ind = TRUE)[1, ]
-  if (length(pos) == 0) return(list(Nt = 0, Nn = 0))
-  x    <- pos[1]; y <- pos[2]
-  xmin <- max(1, x - radius)
-  xmax <- min(N, x + radius)
-  ymin <- max(1, y - radius)
-  ymax <- min(N, y + radius)
-  
-  nbr_idx <- as.vector(grid[xmin:xmax, ymin:ymax])
-  nbr_idx <- nbr_idx[!is.na(nbr_idx) & nbr_idx != idx]
-  Nt <- sum(Cells$Label[nbr_idx] == 1L)
-  Nn <- sum(Cells$Label[nbr_idx] == 0L)
-  list(Nt = Nt, Nn = Nn)
-}
-
-# -------------------------------------------------------------------------
-#                         GROWTH‑RATE FUNCTION
-# -------------------------------------------------------------------------
-
-calc_rate <- function(Cells, grid, idx, cfg, radius) {
-  # Local carrying capacity: size of radius-2 neighborhood window
-  pos      <- which(grid == idx, arr.ind = TRUE)[1, ]
-  xmin     <- max(1, pos[1] - radius)
-  xmax     <- min(nrow(grid), pos[1] + radius)
-  ymin     <- max(1, pos[2] - radius)
-  ymax     <- min(ncol(grid), pos[2] + radius)
-  capacity <- (xmax - xmin + 1) * (ymax - ymin + 1)
-  counts   <- get_neighbour_counts(Cells, grid, idx, cfg$radius)
-  Nt <- counts$Nt; Nn <- counts$Nn
-  
-  a <- cfg$Cg / (((Cells$f[idx]) / cfg$Fd) * cfg$Tg)
-  b <- 1 / a
-  
-  if (Cells$Label[idx] == 1L) {
-    # tumour
-    r <- (cfg$Rt * (Cells$f[idx] / cfg$Fd)) * (1 - ((Nt + a * Nn) / capacity))
-  } else {
-    # normal
-    r <- cfg$Rn * (1 - ((b * Nt + Nn) / capacity))
-  }
-  if(r <= 0)# mark negative r as dead
-  {
-    Cells$Status[idx] <- 0L
-  }
-  return(r)
-}
-
-# -------------------------------------------------------------------------
-#                         CELL DIVISION LOGIC
-# -------------------------------------------------------------------------
-
-divide_cell <- function(Cells, grid, idx, cfg, karyolib) {
-  # 0. Skip dead cells
-  if (Cells$Status[idx] == 0L) {
-    return(list(Cells = Cells, grid = grid))
-  }
-  
-  # 1. Find mother cell position and its free Moore neighbors (8‑neighbourhood)
-  pos <- which(grid == idx, arr.ind = TRUE)[1, ]
-  nbr <- rbind(
-    c(pos[1] - 1, pos[2]    ),  # up
-    c(pos[1] + 1, pos[2]    ),  # down
-    c(pos[1],     pos[2] - 1),  # left
-    c(pos[1],     pos[2] + 1),  # right
-    c(pos[1] - 1, pos[2] - 1),  # up-left
-    c(pos[1] - 1, pos[2] + 1),  # up-right
-    c(pos[1] + 1, pos[2] - 1),  # down-left
-    c(pos[1] + 1, pos[2] + 1)   # down-right
-  )
-  valid    <- nbr[,1] >= 1 & nbr[,1] <= cfg$N &
-    nbr[,2] >= 1 & nbr[,2] <= cfg$N
-  valid_nbr <- nbr[valid, , drop = FALSE]
-  free_pos  <- valid_nbr[is.na(grid[cbind(valid_nbr[,1], valid_nbr[,2])]), , drop = FALSE]
-  if (nrow(free_pos) == 0) {
-    return(list(Cells = Cells, grid = grid))
-  }
-  
-  # 2. Copy mother into two daughters and reset their Time
-  mother    <- Cells[idx, ]
-  daughters <- bind_rows(mother, mother)
-  daughters$Time <- 0L
-  
-  # 3. Assign karyotype, fitness and resource for each daughter
-  speed_ratio <- cfg$Ctd
-
-  # Mother karyotype as integer vector
-  mother_kt <- as.integer(mother[paste0("K", 1:22)])
-
-  # Initialize daughters as faithful copies (no-MS baseline)
-  kt1 <- mother_kt
-  kt2 <- mother_kt
-  f1  <- mother$f
-  f2  <- mother$f
-
-  # Apply MSR only for tumour cells; decide occurrence via Poisson(MSR)
-  # Draw the number of mis-segregation events from Poisson with mean cfg$MSR.
-  # We only care about occurrence (>=1) here.
-  ms_count <- rpois(1, lambda = cfg$MSR)
-  if (Cells$Label[idx] == 1L && ms_count >= 1L) {
-    # Try to find a valid mis-segregation that yields two karyotypes
-    # both present in the karyotype library. Enforce sum conservation:
-    # for each selected chromosome, randomly assign direction.
-    valid_chr <- which(mother_kt >= 1 & mother_kt <= 9)  # need room for -1/+1
-    attempts <- 0L
-    if (length(valid_chr) > 0 && ms_count <= length(valid_chr)) {
-      repeat {
-        attempts <- attempts + 1L
-        sel <- sample(valid_chr, ms_count)
-        kt1 <- mother_kt; kt2 <- mother_kt
-        for (i_chr in sel) {
-          if (runif(1) < 0.5) {
-            # daughter1 loses one copy, daughter2 gains one copy
-            kt1[i_chr] <- mother_kt[i_chr] - 1L
-            kt2[i_chr] <- mother_kt[i_chr] + 1L
-          } else {
-            # daughter1 gains one copy, daughter2 loses one copy
-            kt1[i_chr] <- mother_kt[i_chr] + 1L
-            kt2[i_chr] <- mother_kt[i_chr] - 1L
-          }
-        }
-        f1 <- fitness_of(karyolib, kt1)
-        f2 <- fitness_of(karyolib, kt2)
-        if (!is.na(f1) && !is.na(f2)) break
-        if (attempts >= 200L) {
-          # Fallback: abort MS event if no valid pair found after many tries
-          kt1 <- mother_kt; kt2 <- mother_kt
-          f1  <- mother$f;  f2  <- mother$f
-          break
-        }
-      }
+  if (n_norm > 0) {
+    empty  <- which(is.na(grid), arr.ind = TRUE)
+    sel    <- empty[sample(seq_len(nrow(empty)), min(n_norm, nrow(empty))), , drop = FALSE]
+    for (i in seq_len(nrow(sel))) {
+      next_id <- next_id + 1L
+      row <- make_row(next_id, sel[i,1], sel[i,2], diploid, 0L, 1, 1, cfg$Mnr)
+      row$r <- runif(1, 0.95*cfg$Rn, 1.05*cfg$Rn)
+      Cells <- bind_rows(Cells, row)
+      grid[sel[i,1], sel[i,2]] <- next_id
     }
   }
 
-  # Write daughter karyotypes and fitness, then compute G
+  # Build per-id arrays (length = max_id); we will refresh per step
+  max_id <- max(Cells$id)
+  list(Cells = Cells, grid = grid, max_id = max_id)
+}
+
+# ----------------------- Neighbourhood & Rates --------------------------
+
+# (kept for occasional single queries; uses per-id maps inside)
+get_neighbour_counts <- function(Cells, grid, idx, radius, label_by_id, alive_by_id) {
+  res <- neighbour_counts_xy(grid, label_by_id, alive_by_id, Cells$X[idx], Cells$Y[idx], radius)
+  list(Nt = as.integer(res$Nt), Nn = as.integer(res$Nn))
+}
+
+# Build per-id maps quickly
+build_id_maps <- function(Cells) {
+  max_id <- max(Cells$id)
+  x_by_id <- integer(max_id); y_by_id <- integer(max_id)
+  label_by_id <- integer(max_id); label_by_id[] <- -1L
+  alive_by_id <- integer(max_id)
+  f_by_id <- numeric(max_id)
+
+  alive_rows <- which(Cells$Status == 1L)
+  ids <- Cells$id[alive_rows]
+  x_by_id[ids] <- Cells$X[alive_rows]
+  y_by_id[ids] <- Cells$Y[alive_rows]
+  label_by_id[ids] <- as.integer(Cells$Label[alive_rows])
+  alive_by_id[ids] <- 1L
+  f_by_id[ids] <- Cells$f[alive_rows]
+
+  list(max_id = max_id,
+       active_ids = ids,
+       x_by_id = x_by_id,
+       y_by_id = y_by_id,
+       label_by_id = label_by_id,
+       alive_by_id = alive_by_id,
+       f_by_id = f_by_id)
+}
+
+# ------------------------------- Division -------------------------------
+
+divide_cell <- function(Cells, grid, idx, cfg, karyolib, id_state) {
+  if (Cells$Status[idx] == 0L) return(list(Cells = Cells, grid = grid, id_state = id_state))
+
+  # Mother info
+  mother_id <- Cells$id[idx]
+  pos <- c(Cells$X[idx], Cells$Y[idx])
+
+  # Allocate new stable id
+  new_id <- id_state$max_id + 1L
+  # Ask C++ to pick a free neighbour and place the new id into grid
+  dp <- divide_place_cpp(grid, pos[1], pos[2], new_id, cfg$N)
+  if (!isTRUE(dp$success)) {
+    return(list(Cells = Cells, grid = grid, id_state = id_state))
+  }
+  grid <- dp$grid
+  target_x <- as.integer(dp$x); target_y <- as.integer(dp$y)
+
+  # Prepare daughters by copying mother row
+  mother    <- Cells[idx, ]
+  daughters <- bind_rows(mother, mother)
+  daughters$Time <- 0L
+
+  # MS events through C++
+  mother_kt <- as.integer(mother[paste0("K", 1:22)])
+  ms_res <- apply_ms_events_cpp(
+    mother_kt = mother_kt,
+    label     = as.integer(Cells$Label[idx]),
+    MSR       = as.numeric(cfg$MSR),
+    karyo_lib_str = karyolib$karyotype,
+    karyo_lib_fit = karyolib$fitness,
+    max_attempts  = 200L
+  )
+  kt1 <- as.integer(ms_res$kt1); kt2 <- as.integer(ms_res$kt2)
+  f1  <- as.numeric(ms_res$f1);  f2  <- as.numeric(ms_res$f2)
+
+  speed_ratio <- cfg$Ctd
   for (j in 1:22) {
     daughters[1, paste0("K", j)] <- kt1[j]
     daughters[2, paste0("K", j)] <- kt2[j]
   }
-  daughters$f[1] <- f1
-  daughters$f[2] <- f2
+  daughters$f[1] <- f1; daughters$f[2] <- f2
   daughters$G[1] <- speed_ratio * f1
   daughters$G[2] <- speed_ratio * f2
-  
-  # 4. Place daughters into Cells & grid
-  # overwrite mother with first daughter
-  Cells[idx, ] <- daughters[1, ]
-  
-  # pick a random free spot for second daughter
-  target        <- free_pos[sample(nrow(free_pos), 1), ]
-  daughters$X[2] <- target[1]
-  daughters$Y[2] <- target[2]
-  
-  # append second daughter to Cells and update grid
-  Cells       <- bind_rows(Cells, daughters[2, ])
-  new_idx     <- nrow(Cells)
-  grid[target[1], target[2]] <- new_idx
-  
-  # 5. Recompute growth rate r and DivisionTime for both daughters
-  Cells$DivisionTime[idx]    <- 1 / Cells$r[idx]
-  Cells$DivisionTime[new_idx] <- 1 / Cells$r[new_idx]
 
-  # Noraml cells cannot divide immediately
- if (Cells$Label[idx] == 0L) {
-  Cells$division[idx]     <- 0L
-  Cells$division[new_idx] <- 0L
+  # Overwrite mother in-place (keeps mother_id)
+  Cells[idx, ] <- daughters[1, ]
+
+  # Append daughter #2 as a new row with new stable id & coordinates
+  d2 <- daughters[2, ]
+  d2$id <- new_id
+  d2$X  <- target_x
+  d2$Y  <- target_y
+  # Normal cells: set division=0 after division
+  if (d2$Label == 0L) d2$division <- 0L
+  Cells <- bind_rows(Cells, d2)
+
+  # Update id state
+  id_state$max_id <- new_id
+
+  # DivisionTime will be set after bulk r update
+  list(Cells = Cells, grid = grid, id_state = id_state)
 }
-  
-  return(list(Cells = Cells, grid = grid))
-}
-#
-# -------------------------------------------------------------------------
-#                             DEATH CHECK
-#   - total_supply is now read from YAML config (with fallback)
-# -------------------------------------------------------------------------
+
+# -------------------------------- Death ---------------------------------
 
 death_update <- function(Cells, grid, cfg, step) {
-  # 1. Compute total supply and average per-unit-G supply
+  # (1) Resource threshold death
   total_supply <- if (!is.null(cfg$total_supply)) cfg$total_supply else (cfg$N * cfg$N)
-  total_G      <- sum(Cells$G)
-  
-  # Avoid division by zero
-  if (total_G <= 0) {
-    warning("Total G is zero or negative; skipping death update.")
-    return(list(Cells = Cells, grid = grid))
+  total_G      <- sum(Cells$G[Cells$Status == 1L])
+  if (total_G <= 0) return(list(Cells = Cells, grid = grid))
+
+  avg_supply <- total_supply / total_G
+  death_thr  <- 0.2 * avg_supply
+  dead_idx   <- which(Cells$Status == 1L & Cells$G < death_thr)
+
+  # (2) Random daily death
+  if (step %% 24L == 0L) {
+    u <- runif(nrow(Cells))
+    rand_dead <- which(Cells$Status == 1L &
+                         ((Cells$Label == 1L & u <= cfg$T_death_rate) |
+                          (Cells$Label == 0L & u <= cfg$N_death_rate)))
+    dead_idx <- unique(c(dead_idx, rand_dead))
   }
-  
-  avg_supply   <- total_supply / total_G
-  death_thr    <- 0.2 * avg_supply
-  
-  # 2. Identify cells with G below threshold
-  dead_idx <- which(Cells$G < death_thr)
-  # Random death logic: normal cells use N_death_rate, tumour cells use T_death_rate
-  rand_vals <- runif(nrow(Cells))
-  if (step %% 24L == 0L)
-  {
-    rand_dead <- which(
-    (Cells$Label == 1L & rand_vals <= cfg$T_death_rate) |
-    (Cells$Label == 0L & rand_vals <= cfg$N_death_rate)
-  )
-   dead_idx <- unique(c(dead_idx, rand_dead))
-  }
-  
-  # Additional death rule: if division==1 and abs(TimeToDivide) > 10 * DivisionTime, mark as dead
-  div_delay_dead <- which(
-    Cells$division == 1L &
-    abs(Cells$TimeToDivide) > 5 * Cells$DivisionTime
-  )
+
+  # (3) Division-timeout death
+  div_delay_dead <- which(Cells$Status == 1L &
+                            Cells$division == 1L &
+                            abs(Cells$TimeToDivide) > 5 * Cells$DivisionTime)
   dead_idx <- unique(c(dead_idx, div_delay_dead))
-  
+
+  # Apply deaths: mark status=0 and clear grid positions
   if (length(dead_idx) > 0) {
-    # Mark them dead
-    Cells$Status[dead_idx] <- 0L
-    
-    # 3. Remove dead rows from Cells
-    keep_idx <- which(Cells$Status == 1L)
-    Cells    <- Cells[keep_idx, , drop = FALSE]
-    
-    # 4. Update grid: clear dead positions, then reassign surviving IDs
-    grid[ grid %in% dead_idx ] <- NA_integer_
-    
-    # Because Cells rows have been reindexed, map old IDs → new IDs
-    # keep_idx[i] was old ID for new row i
-    for (new_i in seq_along(keep_idx)) {
-      old_i <- keep_idx[new_i]
-      grid[ grid == old_i ] <- new_i
+    for (i in dead_idx) {
+      if (!is.na(Cells$X[i]) && !is.na(Cells$Y[i])) {
+        grid[Cells$X[i], Cells$Y[i]] <- NA_integer_
+      }
     }
+    Cells$Status[dead_idx] <- 0L
   }
-  
   list(Cells = Cells, grid = grid)
 }
 
-
-
-
-# -------------------------------------------------------------------------
-#                             MIGRATION
-# -------------------------------------------------------------------------
-
+# ------------------------------- Migration ------------------------------
 
 migrate_cells <- function(Cells, grid, cfg) {
-  N <- cfg$N
-  for (i in seq_len(nrow(Cells))) {
-    if (Cells$Status[i] != 1L) next
-    # decide whether to move
+  alive_rows <- which(Cells$Status == 1L)
+  for (i in alive_rows) {
     if (runif(1) < Cells$Mr[i]) {
-      # find Moore neighbors (8‑neighbourhood)
-      pos <- c(Cells$X[i], Cells$Y[i])
-      nbr <- rbind(
-        pos + c(-1,  0),  # up
-        pos + c( 1,  0),  # down
-        pos + c( 0, -1),  # left
-        pos + c( 0,  1),  # right
-        pos + c(-1, -1),  # up-left
-        pos + c(-1,  1),  # up-right
-        pos + c( 1, -1),  # down-left
-        pos + c( 1,  1)   # down-right
-      )
-      # filter valid coords
-      valid <- nbr[,1] >= 1 & nbr[,1] <= N &
-        nbr[,2] >= 1 & nbr[,2] <= N
-      nbr   <- nbr[valid, , drop = FALSE]
-      # pick only empty spots
-      empties <- nbr[ is.na(grid[cbind(nbr[,1], nbr[,2])]), , drop = FALSE]
-      if (nrow(empties) == 0) next
-      # choose one at random
-      tgt <- empties[sample(nrow(empties), 1), ]
-      # update grid
-      grid[pos[1], pos[2]]          <- NA_integer_
-      grid[tgt[1], tgt[2]]          <- i
-      # update cell coords
-      Cells$X[i] <- tgt[1]
-      Cells$Y[i] <- tgt[2]
+      res_cpp <- migrate_one_cpp(grid, Cells$X[i], Cells$Y[i], Cells$id[i], cfg$N)
+      if (isTRUE(res_cpp$success)) {
+        grid <- res_cpp$grid
+        Cells$X[i] <- as.integer(res_cpp$x)
+        Cells$Y[i] <- as.integer(res_cpp$y)
+      }
     }
   }
   list(Cells = Cells, grid = grid)
 }
 
-# Helper: activate normal cell division eligibility
-activate_normal_division <- function(Cells, grid, cfg) {
+# ----------------------- Normal division activation ---------------------
+
+activate_normal_division <- function(Cells, grid, cfg, maps) {
   norm_idxs <- which(Cells$Status == 1L & Cells$Label == 0L & Cells$division == 0L)
+  if (length(norm_idxs) == 0) return(Cells)
   for (i in norm_idxs) {
-    nb_counts <- get_neighbour_counts(Cells, grid, i, cfg$radius)
-    # if tumour neighbor exists and random chance allows division
-    if (nb_counts$Nt > 0 && runif(1) <= cfg$N_division_possibility) {
+    nb_counts <- neighbour_counts_xy(
+      grid,
+      maps$label_by_id,
+      maps$alive_by_id,
+      Cells$X[i], Cells$Y[i], cfg$radius
+    )
+    Nt <- as.integer(nb_counts$Nt)
+    if (Nt > 0 && runif(1) <= cfg$N_division_possibility) {
       Cells$division[i]     <- 1L
       Cells$Time[i]         <- 0L
       Cells$TimeToDivide[i] <- 0L
-      Cells$DivisionTime[i] <- 1 / Cells$r[i]
-    }
-    # if no tumour neighbor and lower chance allows division
-    if (nb_counts$Nt == 0 && runif(1) <= (cfg$N_division_possibility / 10)) {
+    } else if (Nt == 0 && runif(1) <= (cfg$N_division_possibility / 10)) {
       Cells$division[i]     <- 1L
       Cells$Time[i]         <- 0L
       Cells$TimeToDivide[i] <- 0L
-      Cells$DivisionTime[i] <- 1 / Cells$r[i]
     }
   }
   Cells
 }
 
-
-# -------------------------------------------------------------------------
-#                          MAIN SIMULATION LOOP
-# -------------------------------------------------------------------------
+# --------------------------- Main simulation ----------------------------
 
 run_simulation <- function(cfg_file, karyolib_file, outputdir, prefix = "Cells") {
-  cfg         <- read_config(cfg_file)
-  karyolib    <- read_karyolib(karyolib_file)
-  cfg$Fd      <- karyolib$fitness[match(kt_vec2str(rep(2L, 22)), karyolib$karyotype)]
-  cfg$Tg      <- 1.2 * cfg$Cg
-  
+  cfg <- read_config(cfg_file)
+  karyolib <- read_karyolib(karyolib_file)
+  cfg$Fd <- karyolib$fitness[match(kt_vec2str(rep(2L, 22)), karyolib$karyotype)]
+  cfg$Tg <- 1.2 * cfg$Cg
+  run_simulation_cfg(cfg, karyolib, outputdir, prefix)
+}
+
+# Helper function: run simulation with parsed cfg and karyolib directly
+run_simulation_cfg <- function(cfg, karyolib, outputdir, prefix = "Cells", global_id = NA_integer_) {
   init        <- init_cells(cfg, karyolib)
   Cells       <- init$Cells
+  Cells$global_id <- as.integer(global_id)
   grid        <- init$grid
-  
+  id_state    <- list(max_id = init$max_id)
+
+  # initial per-id maps + bulk r
+  maps <- build_id_maps(Cells)
+  r_active <- calc_rates_all_cpp(grid,
+                                 maps$active_ids,
+                                 maps$x_by_id, maps$y_by_id,
+                                 maps$label_by_id, maps$f_by_id, maps$alive_by_id,
+                                 cfg$Rt, cfg$Rn, cfg$Cg, cfg$Fd, cfg$Tg,
+                                 cfg$radius)
+  # assign back by id
+  if (length(maps$active_ids) > 0) {
+    idx_alive <- which(Cells$Status == 1L)
+    pos <- match(Cells$id[idx_alive], maps$active_ids)
+    Cells$r[idx_alive] <- r_active[pos]
+  }
+  Cells$DivisionTime <- ifelse(Cells$Status == 1L, 1 / pmax(Cells$r, 1e-12), NA_real_)
+  Cells$TimeToDivide <- ifelse(Cells$Status == 1L, Cells$DivisionTime - Cells$Time, NA_real_)
+
   step        <- 0L
   day_index   <- 0L
-  write.csv(Cells, sprintf(paste0(outputdir,"/Results/%s_day%03d.csv"), prefix, day_index), row.names = FALSE)
-  cat("Day", day_index, ":", nrow(Cells), "living cells saved\n")
+
+  # day 0 snapshot
+  dir.create(file.path(outputdir, "csv"), showWarnings = FALSE, recursive = TRUE)
+  dir.create(file.path(outputdir, "png"), showWarnings = FALSE, recursive = TRUE)
+  write.csv(Cells, sprintf(paste0(outputdir, "/csv/%s_day%03d.csv"), prefix, day_index), row.names = FALSE)
+  cat("Day", day_index, ":", sum(Cells$Status==1L), "living cells saved\n")
+
+  # Build K matrix once (will be replaced by C++ returns after each hour)
+  k_cols <- paste0("K", 1:22)
+  K_mat <- as.matrix(Cells[, k_cols])
+
   repeat {
     step <- step + 1L
 
-    # Activate normal cell division
-    Cells <- activate_normal_division(Cells, grid, cfg)
+    # Call one full hourly step in C++
+    res <- hourly_step_core_cpp(
+      grid = grid,
+      id   = Cells$id,
+      X    = Cells$X,
+      Y    = Cells$Y,
+      Label= as.integer(Cells$Label),
+      Status= Cells$Status,
+      division = Cells$division,
+      Time  = Cells$Time,
+      DivisionTime = Cells$DivisionTime,
+      TimeToDivide = Cells$TimeToDivide,
+      r = Cells$r,
+      f = Cells$f,
+      G = Cells$G,
+      Mr = Cells$Mr,
+      K  = K_mat,
+      Rt = cfg$Rt, Rn = cfg$Rn, Cg = cfg$Cg, Fd = cfg$Fd, Tg = cfg$Tg,
+      radius = cfg$radius, N_division_possibility = cfg$N_division_possibility,
+      T_death_rate = cfg$T_death_rate, N_death_rate = cfg$N_death_rate,
+      total_supply = cfg$total_supply, DTr = cfg$DTr, DNr = cfg$DNr, MSR = cfg$MSR, Ctd = cfg$Ctd,
+      step = step, N = cfg$N, max_id = id_state$max_id,
+      karyo_lib_str = karyolib$karyotype,
+      karyo_lib_fit = karyolib$fitness
+    )
 
-    # advance internal clocks -------------------------------------------
-    Cells$Time <- Cells$Time + 1
-    Cells$TimeToDivide<-Cells$DivisionTime-Cells$Time
-    # identify cells ready to divide using TimeToDivide <= 0 and Status == 1
-    to_divide_idx <- which(Cells$Status == 1L & Cells$TimeToDivide <= 0 & Cells$division == 1L)
-    for (idx in to_divide_idx) {
-      res <- divide_cell(Cells, grid, idx, cfg, karyolib)
-      Cells <- res$Cells; grid <- res$grid
-    }
-    for (idx in 1:nrow(Cells))
-    {
-        Cells$r[idx] <- calc_rate(Cells, grid, idx, cfg, cfg$radius)
-    }
-    # death --------------------------------------------------------------
-    res <- death_update(Cells, grid, cfg, step)
-    Cells <- res$Cells
+    # Rebuild Cells from the C++ return to avoid size-mismatch issues
     grid <- res$grid
-    # migration------------------------------------------------------------
-    mig <- migrate_cells(Cells, grid, cfg)
-    Cells <- mig$Cells
-    grid  <- mig$grid
-    
-    # update growth rates r ----------------------------------------------
-    # Recalculate growth rates for all cells
-    # This is done after migration
-    for (idx in 1:nrow(Cells))
-    {
-        Cells$r[idx] <- calc_rate(Cells, grid, idx, cfg, cfg$radius)
-    }
+    Cells <- tibble(
+      id = as.integer(res$id),
+      X  = as.integer(res$X),
+      Y  = as.integer(res$Y),
+      f  = as.numeric(res$f),
+      r  = as.numeric(res$r),
+      G  = as.numeric(res$G),
+      Label = as.integer(res$Label),
+      DivisionTime = as.numeric(res$DivisionTime),
+      Time = as.integer(res$Time),
+      Status = as.integer(res$Status),
+      Mr = as.numeric(res$Mr),
+      TimeToDivide = as.numeric(res$TimeToDivide),
+      division = as.integer(res$division)
+    )
+    Cells$global_id <- as.integer(global_id)
 
-    # daily snapshot -----------------------------------------------------
+    # Write K columns back to the data frame
+    K_mat <- res$K
+    for (j in 1:22) Cells[[paste0("K", j)]] <- K_mat[, j]
+
+    id_state$max_id <- res$max_id
+
+    # Daily snapshot
     if (step %% 24L == 0L) {
       day_index <- day_index + 1L
-      # Build file paths once
-      csv_path <- sprintf(paste0(outputdir, "/Results/%s_day%03d.csv"), prefix, day_index)
-      png_path <- sub("\\.csv$", ".png", csv_path)
 
-      # Save CSV snapshot
-      write.csv(Cells, csv_path, row.names = FALSE)
+      # --- living-only snapshot ---
+      live_idx   <- which(Cells$Status == 1L)
+      Cells_live <- Cells[live_idx, , drop = FALSE]
 
-      # Prepare colours: tumour (Label==1) red, normal (Label==0) green
-      cols <- ifelse(Cells$Label == 1L, "red", "green")
+      csv_path <- sprintf(paste0(outputdir, "/csv/%s_day%03d.csv"), prefix, day_index)
+      png_path <- sprintf(paste0(outputdir, "/png/%s_day%03d.png"), prefix, day_index)
 
-      # Draw PNG scatter (no axes), fixed limits 1..100
-      png(filename = png_path, width = 500, height = 500, units = "px")
+      # Write CSV with living cells only
+      write.csv(Cells_live, csv_path, row.names = FALSE)
+
+      # Plot PNG (living cells only), no axes; Label=1 red, Label=0 green
+      png(filename = png_path, width = 1000, height = 1000, units = "px")
       op <- par(mar = c(0, 0, 0, 0))
-      plot(Cells$X, Cells$Y,
-           col = cols, pch = 16,
-           xlim = c(1, 100), ylim = c(1, 100),
-           axes = FALSE, xlab = "", ylab = "", asp = 1)
-      par(op)
-      dev.off()
+      plot(NA, xlim = c(1, cfg$N), ylim = c(1, cfg$N), axes = FALSE, xlab = "", ylab = "", asp = 1)
+      if (nrow(Cells_live) > 0) {
+        idx_norm <- which(Cells_live$Label == 0L)
+        idx_tum  <- which(Cells_live$Label == 1L)
+        if (length(idx_norm)) points(Cells_live$X[idx_norm], Cells_live$Y[idx_norm], pch = 16, cex = 0.8, col = "green")
+        if (length(idx_tum))  points(Cells_live$X[idx_tum],  Cells_live$Y[idx_tum],  pch = 16, cex = 0.8, col = "red")
+      }
+      par(op); dev.off()
 
-      cat("Day", day_index, ":", nrow(Cells), "living cells saved\n")
+      # Log message
+      cat("Day", day_index, ":", nrow(Cells_live), "living cells saved\n")
+
+      # Compact in-memory state: drop dead rows from Cells and K_mat
+      if (length(live_idx) < nrow(Cells)) {
+        Cells <- Cells[live_idx, , drop = FALSE]
+        K_mat <- K_mat[live_idx, , drop = FALSE]
+      }
     }
-    
-    # termination: grid full --------------------------------------------
+
+    # Stop when grid is full (no NA)
     if (all(!is.na(grid))) {
-      cat("Grid saturated (", nrow(Cells), "cells). Stopping.\n", sep = "")
+      cat("Grid saturated (", sum(Cells$Status==1L), "cells). Stopping.\n", sep = "")
       break
     }
   }
+
   invisible(Cells)
 }
 
-# -------------------------------------------------------------------------
-#                            EXAMPLE CALL
-# -------------------------------------------------------------------------
+# ----------------------- Batch runner from YAML -----------------------
+run_ABM_simulation <- function(cfg_file, karyolib_file, base_output, workers = max(1, parallel::detectCores() - 1)) {
+  cfg0 <- read_config(cfg_file)
+  karyolib <- read_karyolib(karyolib_file)
+  cfg0$Fd <- karyolib$fitness[match(kt_vec2str(rep(2L, 22)), karyolib$karyotype)]
+  cfg0$Tg <- 1.2 * cfg0$Cg
 
-# Uncomment to run with your own paths ------------------------------------
-# result <- run_simulation("config.yaml", "karyolib.csv")
+  supplies <- cfg0$total_supply_vec
+  reps <- cfg0$replicates
 
-result <- run_simulation('/Users/4482173/Library/CloudStorage/OneDrive-MoffittCancerCenter/GitHub/GBM_gowth_model/config.yaml', '/Users/4482173/Library/CloudStorage/OneDrive-MoffittCancerCenter/GitHub/GBM_gowth_model/merged_mean.csv',"/Users/4482173/Documents/Project/GBM_Model")
+  # Prepare all jobs (supply x replicate) with simulation index reset per supply
+  jobs <- list()
+  for (s in supplies) {
+    supply_label <- format(signif(s / (cfg0$N * cfg0$N), 6), trim = TRUE)
+    # reset counter per supply
+    for (r in seq_len(reps)) {
+      out_dir <- file.path(base_output, "Results", supply_label, sprintf("Sim_%03d", r))
+      cfg_i <- cfg0
+      cfg_i$total_supply <- s
+      jobs[[length(jobs)+1L]] <- list(
+        cfg = cfg_i,
+        out_dir = out_dir,
+        prefix = sprintf("Cells_supply_%s_rep%03d", gsub("[^0-9.]", "", supply_label), r),
+        cfg_path = cfg_file,
+        karyolib_path = karyolib_file,
+        global_id = as.integer(r)  # within-supply replicate id (001..reps)
+      )
+    }
+  }
+
+  # Create a manifest to verify mapping (supply x replicate -> folder/prefix)
+  results_root <- file.path(base_output, "Results")
+  dir.create(results_root, recursive = TRUE, showWarnings = FALSE)
+  if (length(jobs) > 0) {
+    manifest <- tibble::tibble(
+      supply_value = vapply(jobs, function(j) j$cfg$total_supply, numeric(1)),
+      supply_ratio = vapply(jobs, function(j) j$cfg$total_supply / (cfg0$N * cfg0$N), numeric(1)),
+      supply_label = vapply(jobs, function(j) basename(dirname(j$out_dir)), character(1)),
+      replicate    = vapply(jobs, function(j) as.integer(j$global_id), integer(1)),
+      global_id    = vapply(jobs, function(j) as.integer(j$global_id), integer(1)),
+      out_dir      = vapply(jobs, function(j) j$out_dir, character(1)),
+      prefix       = vapply(jobs, function(j) j$prefix, character(1))
+    )
+    write.csv(manifest, file.path(results_root, "manifest.csv"), row.names = FALSE)
+  }
+
+  # Run in parallel, avoiding global serialization and reloading code/kernels in each worker
+  old_plan <- future::plan()
+  on.exit({ try(future::plan(old_plan), silent = TRUE) }, add = TRUE)
+  future::plan(future::multisession, workers = workers)
+
+  future_lapply(
+    jobs,
+    FUN = function(job) {
+      # Resolve project root from cfg path
+      proj_dir <- dirname(job$cfg_path)
+      # Load compiled kernels in the worker (no rebuild)
+      Rcpp::sourceCpp(file.path(proj_dir, "src", "abm_kernels.cpp"), rebuild = FALSE, verbose = FALSE)
+      # Source this script to get all R helpers into the worker session
+      suppressMessages(source(file.path(proj_dir, "GBM_abm.R"), local = TRUE, chdir = TRUE))
+      # Read karyotype library in the worker
+      karyolib <- read_karyolib(job$karyolib_path)
+      # Prepare cfg for this job (Fd, Tg depend on karyolib)
+      cfg_i <- job$cfg
+      cfg_i$Fd <- karyolib$fitness[match(kt_vec2str(rep(2L, 22)), karyolib$karyotype)]
+      cfg_i$Tg <- 1.2 * cfg_i$Cg
+
+      # Log which supply/replicate this worker is running
+      ratio_str <- format(signif(cfg_i$total_supply / (cfg_i$N * cfg_i$N), 6), trim = TRUE)
+      cat(sprintf("[RUN] supply_ratio=%s, replicate=%s -> %s\n",
+                  ratio_str,
+                  sprintf("%03d", as.integer(job$global_id)),
+                  job$out_dir))
+
+      # Ensure output directory exists and drop a small job_info file for auditing
+      dir.create(job$out_dir, recursive = TRUE, showWarnings = FALSE)
+      write.csv(
+        data.frame(
+          supply_value = cfg_i$total_supply,
+          supply_ratio = as.numeric(cfg_i$total_supply) / (cfg_i$N * cfg_i$N),
+          replicate    = as.integer(job$global_id),
+          global_id    = as.integer(job$global_id),
+          prefix       = job$prefix
+        ),
+        file = file.path(job$out_dir, "job_info.csv"), row.names = FALSE
+      )
+
+      # Run single simulation
+      run_simulation_cfg(cfg_i, karyolib, job$out_dir, prefix = job$prefix, global_id = job$global_id)
+      invisible(TRUE)
+    },
+    future.globals = FALSE,
+    future.packages = c("Rcpp","yaml","dplyr","tibble","future.apply"),
+    future.seed = TRUE
+  )
+}
