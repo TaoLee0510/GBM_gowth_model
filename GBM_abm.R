@@ -60,6 +60,9 @@ read_config <- function(path) {
   # Replicates from YAML (default 1)
   cfg_raw$replicates <- as.integer(cfg_raw$replicates %||% 1L)
   if (is.na(cfg_raw$replicates) || cfg_raw$replicates < 1L) cfg_raw$replicates <- 1L
+  # Simulation horizon (steps / hours)
+  cfg_raw$Time <- as.integer(cfg_raw$Time %||% 2400L)  # default 2400 hours (~100 days)
+  if (is.na(cfg_raw$Time) || cfg_raw$Time < 1L) cfg_raw$Time <- 240L
   return(cfg_raw)
 }
 
@@ -362,7 +365,9 @@ run_simulation_cfg <- function(cfg, karyolib, outputdir, prefix = "Cells", globa
   k_cols <- paste0("K", 1:22)
   K_mat <- as.matrix(Cells[, k_cols])
 
-  repeat {
+  max_steps <- as.integer(cfg$Time)
+  if (is.na(max_steps) || max_steps < 1L) max_steps <- 240L
+  while (step < max_steps) {
     step <- step + 1L
 
     # Call one full hourly step in C++
@@ -452,13 +457,8 @@ run_simulation_cfg <- function(cfg, karyolib, outputdir, prefix = "Cells", globa
       }
     }
 
-    # Stop when grid is full (no NA)
-    if (all(!is.na(grid))) {
-      cat("Grid saturated (", sum(Cells$Status==1L), "cells). Stopping.\n", sep = "")
-      break
-    }
   }
-
+  cat("Reached configured Time =", cfg$Time, "hours. Simulation finished (living cells:", sum(Cells$Status==1L), ").\n")
   invisible(Cells)
 }
 

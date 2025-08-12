@@ -15,6 +15,4 @@ total_supply: "0.1,0.25,0.5,1,2"                   # total supply of Glu
 DTr: 0.2                      # tumor cells Glu death proportion
 DNr: 0.02                      # normal cells Glu death proportion
 replicates: 10                  # number of replicates
-
-
-
+Time: 12000                 # total simulation time in hours (termination criterion)
