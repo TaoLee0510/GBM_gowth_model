@@ -1,2 +1,6 @@
 GBM_abm copy.R
 karyolibs.R
+/Results
+.Rhistory
+.Rapp.history
+.DS_Store
