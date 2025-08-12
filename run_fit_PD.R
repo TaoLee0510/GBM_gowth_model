@@ -1,0 +1,33 @@
+base_output <- "/Users/4482173/Library/CloudStorage/OneDrive-MoffittCancerCenter/GitHub/GBM_gowth_model"
+
+source("/Users/4482173/Library/CloudStorage/OneDrive-MoffittCancerCenter/GitHub/GBM_gowth_model/fit_PD.R")
+#
+# 1) Fit all simulations under a specific supply together:
+fit_PD_from_results(file.path(base_output, "Results"),
+                    exclude_daily = TRUE,   # Exclude hours where step%%24==0
+                    bins = 30,
+                    fit_gam = TRUE,
+                    fd = 1.0,               # Pass your Fd; use NA if unknown
+                    rt = 0.02,          # Pass your Rt; use NA if you don't want to use it
+                    death_mode = "resource_only")              # c("resource_only", "all", "random_only", "timeout_only")
+
+# 2) Or manually read the events data for one supply and fit:
+ev <- read_events_dir(file.path(base_output, "Results", "1", "Sim_001", "events"))
+fit_PD_from_events(ev, out_prefix = file.path(base_output, "Results", "1", "Sim_001", "PD_fit_single"))
+
+
+
+base_output <- "/Users/4482173/Library/CloudStorage/OneDrive-MoffittCancerCenter/GitHub/GBM_gowth_model"
+summarize_PD_all(
+  results_root   = file.path(base_output, "Results"),
+  exclude_daily  = TRUE,
+  bins           = 30,
+  fit_gam        = TRUE,
+  fd             = 1.0,
+  rt             = 0.02,
+  death_mode     = "resource_only",  # or "all" / "random_only" / "timeout_only"
+  g_points       = 200,
+  overwrite_fit  = FALSE             # Set to TRUE to rerun the _ALL fit for each supply
+)
+
+

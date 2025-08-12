@@ -400,11 +400,20 @@ List hourly_step_core_cpp(IntegerMatrix grid,
                      double Rt, double Rn, double Cg, double Fd, double Tg,
                      int radius, double N_division_possibility,
                      double T_death_rate, double N_death_rate,
-                     double total_supply, double DTr, double DNr, double MSR, double Ctd,
+                     double total_supply, double DTr, double DNr, std::string supply_mode, double MSR, double Ctd,
                      int step, int N, int max_id,
                      CharacterVector karyo_lib_str,
                      NumericVector  karyo_lib_fit) {
   int n = id.size();
+
+  // Per-cell hourly glucose allocation and event flags
+  NumericVector g_alloc(n, 0.0);
+  IntegerVector div_event(n, 0);
+  IntegerVector death_event(n, 0);
+  IntegerVector risk_div(n, 0);        // 1 if cell is in the division risk set this hour
+  IntegerVector death_resource(n, 0);  // 1 if a resource-based death occurred this hour
+  IntegerVector death_random(n, 0);    // 1 if a random (daily) death occurred this hour
+  IntegerVector death_timeout(n, 0);   // 1 if a timeout death occurred this hour
 
   // Build id->row map (size max_id+1)
   IntegerVector id2row(max_id + 1, NA_INTEGER);
@@ -457,6 +466,11 @@ List hourly_step_core_cpp(IntegerMatrix grid,
     }
   }
 
+  // Mark division risk set at the start of the hour (before clocks advance)
+  for (int irow = 0; irow < n; ++irow) {
+    if (Status[irow] == 1 && division[irow] == 1) risk_div[irow] = 1; else risk_div[irow] = 0;
+  }
+
   // (B) Advance clocks by 1 hour for all alive cells
   for (int irow = 0; irow < n; ++irow) if (Status[irow] == 1) Time[irow] += 1;
 
@@ -501,6 +515,9 @@ List hourly_step_core_cpp(IntegerMatrix grid,
     int dx = as<int>(dp["x"]);
     int dy = as<int>(dp["y"]);
 
+    // Mark a division event for the mother row in this hour
+    div_event[irow] = 1;
+
     // MS and fitness for both daughters
     IntegerVector kt1, kt2; double f1v = f[irow], f2v = f[irow];
     apply_ms(irow, kt1, kt2, f1v, f2v);
@@ -527,6 +544,15 @@ List hourly_step_core_cpp(IntegerMatrix grid,
     f.push_back(f2v);
     G.push_back(Ctd * f2v);
     Mr.push_back(Mr[irow]);
+
+    // Extend per-hour allocation & event flags to keep vector sizes consistent
+    g_alloc.push_back(0.0);
+    div_event.push_back(0);
+    death_event.push_back(0);
+    risk_div.push_back(0);
+    death_resource.push_back(0);
+    death_random.push_back(0);
+    death_timeout.push_back(0);
 
     // Resize K (n+1 x 22)
     IntegerMatrix Knew(new_n, 22);
@@ -583,21 +609,138 @@ List hourly_step_core_cpp(IntegerMatrix grid,
   }
 
   // (E) Death updates
-  // Resource-based
+  // First compute per-cell hourly glucose allocation g_alloc[i]
   double total_G = 0.0;
-  for (int irow = 0; irow < n; ++irow) if (Status[irow] == 1) total_G += G[irow];
-  if (total_G > 0) {
-    const double base = (total_supply / total_G);
-    for (int irow = 0; irow < n; ++irow) if (Status[irow] == 1) {
-      const double frac = (Label[irow] == 1) ? DTr : DNr; // tumour vs normal
-      const double thr  = frac * base;
-      if (G[irow] < thr) {
-        int gx = X[irow], gy = Y[irow];
-        if (gx >= 1 && gx <= N && gy >= 1 && gy <= N) {
-          int gid = grid(gx - 1, gy - 1);
-          if (!IntegerVector::is_na(gid) && gid == id[irow]) grid(gx - 1, gy - 1) = NA_INTEGER;
+  int    alive_cnt = 0;
+  for (int irow = 0; irow < n; ++irow) if (Status[irow] == 1) { total_G += G[irow]; ++alive_cnt; }
+  // Lowercase supply_mode for case-insensitive comparison
+  std::string mode_lc = supply_mode;
+  std::transform(mode_lc.begin(), mode_lc.end(), mode_lc.begin(), ::tolower);
+  if (alive_cnt > 0) {
+    if (mode_lc == "proportional") {
+      // --- Rank-based culling under proportional mode ---
+      // Each alive cell has a "need" = frac_i * G[i].
+      // Tie-break policy: random tie-break among equal-need cells using a shuffled order before a stable sort.
+      // If total need exceeds supply, we cull the largest-need cells first
+      // (ties broken at random) until the remaining total need fits the supply.
+      // This enforces that high-demand cells are more vulnerable under scarcity.
+
+      // 1) Collect alive indices and compute per-cell need
+      std::vector<int> alive_idx; alive_idx.reserve(alive_cnt);
+      std::vector<double> need;   need.reserve(alive_cnt);
+      double total_need = 0.0;
+      for (int irow = 0; irow < n; ++irow) if (Status[irow] == 1) {
+        const double frac = (Label[irow] == 1) ? DTr : DNr;
+        const double nd = frac * G[irow];
+        alive_idx.push_back(irow);
+        need.push_back(nd);
+        total_need += nd;
+      }
+
+      // 2) If feasible, nobody dies
+      if (total_need <= total_supply) {
+        // Keep g_alloc as already computed (proportional to G/total_G)
+        // If total_G > 0, assign proportional allocation; else split equally
+        if (total_G > 0) {
+          for (int irow = 0; irow < n; ++irow) if (Status[irow] == 1) {
+            g_alloc[irow] = total_supply * (G[irow] / total_G);
+          }
+        } else {
+          double base = total_supply / static_cast<double>(alive_cnt);
+          for (int irow = 0; irow < n; ++irow) if (Status[irow] == 1) g_alloc[irow] = base;
         }
-        Status[irow] = 0;
+        // Nothing else to do here.
+      } else {
+        // 3) Sort by need ASC with random tie-break to avoid systematic bias
+        //    We shuffle first, then stable-sort by need.
+        {
+          std::random_device rd2;
+          std::mt19937 gen2(rd2());
+          std::shuffle(alive_idx.begin(), alive_idx.end(), gen2);
+        }
+        // Build pair (idx, need) using the shuffled order
+        std::vector<std::pair<int,double>> pairs; pairs.reserve(alive_idx.size());
+        for (size_t k = 0; k < alive_idx.size(); ++k) {
+          int irow = alive_idx[k];
+          const double frac = (Label[irow] == 1) ? DTr : DNr;
+          pairs.emplace_back(irow, frac * G[irow]);
+        }
+        std::stable_sort(pairs.begin(), pairs.end(),
+                         [](const std::pair<int,double>& a, const std::pair<int,double>& b){
+                           return a.second < b.second; // ascending by need
+                         });
+
+        // 4) Keep smallest needs until capacity; mark the rest as dead (resource)
+        double cum_need = 0.0;
+        std::vector<char> keep(n, 0);
+        for (size_t k = 0; k < pairs.size(); ++k) {
+          int irow = pairs[k].first;
+          double nd = pairs[k].second;
+          if (cum_need + nd <= total_supply) {
+            keep[irow] = 1;
+            cum_need += nd;
+          } else {
+            keep[irow] = 0;
+          }
+        }
+
+        // 5) Apply deaths for those not kept
+        for (size_t k = 0; k < pairs.size(); ++k) {
+          int irow = pairs[k].first;
+          if (keep[irow] == 0) {
+            int gx = X[irow], gy = Y[irow];
+            if (gx >= 1 && gx <= N && gy >= 1 && gy <= N) {
+              int gid = grid(gx - 1, gy - 1);
+              if (!IntegerVector::is_na(gid) && gid == id[irow]) grid(gx - 1, gy - 1) = NA_INTEGER;
+            }
+            Status[irow] = 0;
+            death_event[irow] = 1;
+            death_resource[irow] = 1;
+            death_random[irow] = 0;
+            death_timeout[irow] = 0;
+            g_alloc[irow] = 0.0; // no allocation for culled rows
+          }
+        }
+
+        // 6) Optionally recompute g_alloc for survivors as proportional among survivors
+        double total_G_surv = 0.0;
+        for (int irow = 0; irow < n; ++irow) if (Status[irow] == 1) total_G_surv += G[irow];
+        if (total_G_surv > 0) {
+          for (int irow = 0; irow < n; ++irow) if (Status[irow] == 1) {
+            g_alloc[irow] = total_supply * (G[irow] / total_G_surv);
+          }
+        } else {
+          // no survivors; nothing to reassign
+        }
+      }
+    } else {
+      // equal mode
+      double base = total_supply / static_cast<double>(alive_cnt);
+      for (int irow = 0; irow < n; ++irow) if (Status[irow] == 1) g_alloc[irow] = base;
+    }
+  }
+  // Then perform resource-based death checks using per-cell allocation.
+  // Proportional mode: compare g_alloc[i] to (DTr/DNr) * G[i] (cell-specific).
+  // Equal mode: compare equal base allocation to (DTr/DNr) * G[i].
+  if (alive_cnt > 0) {
+    if (mode_lc == "proportional") {
+      // (resource-based deaths already handled in rank-based culling above)
+    } else {
+      const double base = total_supply / static_cast<double>(alive_cnt); // absolute supply per cell
+      for (int irow = 0; irow < n; ++irow) if (Status[irow] == 1) {
+        const double frac = (Label[irow] == 1) ? DTr : DNr;
+        if (base < G[irow] * frac) {
+          int gx = X[irow], gy = Y[irow];
+          if (gx >= 1 && gx <= N && gy >= 1 && gy <= N) {
+            int gid = grid(gx - 1, gy - 1);
+            if (!IntegerVector::is_na(gid) && gid == id[irow]) grid(gx - 1, gy - 1) = NA_INTEGER;
+          }
+          Status[irow] = 0;
+          death_event[irow] = 1;
+          death_resource[irow] = 1; // mark resource-based death
+          death_random[irow] = 0;
+          death_timeout[irow] = 0;
+        }
       }
     }
   }
@@ -612,6 +755,10 @@ List hourly_step_core_cpp(IntegerMatrix grid,
           if (!IntegerVector::is_na(gid) && gid == id[irow]) grid(gx - 1, gy - 1) = NA_INTEGER;
         }
         Status[irow] = 0;
+        death_event[irow] = 1;
+        death_random[irow] = 1;
+        death_timeout[irow] = 0;
+        death_resource[irow] = 0;
       }
     }
   }
@@ -624,6 +771,10 @@ List hourly_step_core_cpp(IntegerMatrix grid,
         if (!IntegerVector::is_na(gid) && gid == id[irow]) grid(gx - 1, gy - 1) = NA_INTEGER;
       }
       Status[irow] = 0;
+      death_event[irow] = 1;
+      death_random[irow] = 0;
+      death_timeout[irow] = 1;
+      death_resource[irow] = 0;
     }
   }
 
@@ -656,6 +807,13 @@ List hourly_step_core_cpp(IntegerMatrix grid,
     _["G"] = G,
     _["Mr"] = Mr,
     _["K"] = K,
-    _["max_id"] = max_id
+    _["max_id"] = max_id,
+    _["g_alloc"] = g_alloc,
+    _["div_event"] = div_event,
+    _["death_event"] = death_event,
+    _["risk_div"] = risk_div,
+    _["death_resource"] = death_resource,
+    _["death_random"] = death_random,
+    _["death_timeout"] = death_timeout
   );
 }
