@@ -392,6 +392,7 @@ List hourly_step_core_cpp(IntegerMatrix grid,
                      IntegerVector Time,
                      NumericVector DivisionTime,
                      NumericVector TimeToDivide,
+                     NumericVector Cooldown,
                      NumericVector r,
                      NumericVector f,
                      NumericVector G,
@@ -400,7 +401,7 @@ List hourly_step_core_cpp(IntegerMatrix grid,
                      double Rt, double Rn, double Cg, double Fd, double Tg,
                      int radius, double N_division_possibility,
                      double T_death_rate, double N_death_rate,
-                     double total_supply, double DTr, double DNr, std::string supply_mode, double MSR, double Ctd,
+                     double total_supply, double DTr, double DNr, std::string supply_mode, double MSR, double Ctd, double CooldownFactor,
                      int step, int N, int max_id,
                      CharacterVector karyo_lib_str,
                      NumericVector  karyo_lib_fit) {
@@ -414,6 +415,9 @@ List hourly_step_core_cpp(IntegerMatrix grid,
   IntegerVector death_resource(n, 0);  // 1 if a resource-based death occurred this hour
   IntegerVector death_random(n, 0);    // 1 if a random (daily) death occurred this hour
   IntegerVector death_timeout(n, 0);   // 1 if a timeout death occurred this hour
+    // Per-hour need and pressure metric to export (distinct names to avoid shadowing locals)
+  NumericVector need_hour(n, NA_REAL);
+  NumericVector need_over_g_hour(n, NA_REAL);
 
   // Build id->row map (size max_id+1)
   IntegerVector id2row(max_id + 1, NA_INTEGER);
@@ -456,6 +460,7 @@ List hourly_step_core_cpp(IntegerMatrix grid,
     if (Status[irow] != 1) continue;
     if (Label[irow] != 0) continue; // only normal
     if (division[irow] != 0) continue;
+    if (Cooldown[irow] > 0.0) continue; // still cooling down
     auto nb = nb_counts_row(irow);
     int Nt = nb.first;
     // Only activate if tumour neighbours exist; no baseline activation when Nt==0
@@ -472,7 +477,14 @@ List hourly_step_core_cpp(IntegerMatrix grid,
   }
 
   // (B) Advance clocks by 1 hour for all alive cells
-  for (int irow = 0; irow < n; ++irow) if (Status[irow] == 1) Time[irow] += 1;
+  for (int irow = 0; irow < n; ++irow) {
+    if (Status[irow] == 1) {
+      Time[irow] += 1;
+      if (Cooldown[irow] > 0.0) {
+        Cooldown[irow] = std::max(0.0, Cooldown[irow] - 1.0);
+      }
+    }
+  }
 
   // (C) Division attempts: collect ready rows and shuffle
   std::vector<int> ready;
@@ -528,16 +540,26 @@ List hourly_step_core_cpp(IntegerMatrix grid,
 
     // Update mother in place -> daughter #1
     for (int c = 0; c < 22; ++c) K(irow, c) = kt1[c];
+    double cd = 0.0;
     if (is_tumor) {
       // Tumor uses MS-derived fitness and tumor glucose rule
       f[irow]  = f1v;
       G[irow]  = Ctd * f1v;
+      // Tumor cooldown remains 0
+      Cooldown[irow] = 0.0;
     } else {
       // Normal keeps baseline fitness and uses normal glucose Cg
       // (ignore MS-derived fitness for normals)
       f[irow]  = f[irow];  // keep baseline (typically 1.0)
       G[irow]  = Cg;
       division[irow] = 0;  // normal mother leaves divisible state after division
+      // Cooldown = CooldownFactor × cycle time; if CooldownFactor==0, disable cooldown
+      if (CooldownFactor > 0.0) {
+        cd = CooldownFactor * DivisionTime[irow];
+      } else {
+        cd = 0.0;
+      }
+      Cooldown[irow] = cd;
     }
     Time[irow] = 0;
 
@@ -556,10 +578,13 @@ List hourly_step_core_cpp(IntegerMatrix grid,
       // Tumor daughter uses MS-derived fitness and tumor glucose rule
       f.push_back(f2v);
       G.push_back(Ctd * f2v);
+      Cooldown.push_back(0.0);
     } else {
       // Normal daughter keeps baseline fitness and uses normal glucose Cg
       f.push_back(f[irow]);
       G.push_back(Cg);
+      // For normals, daughter inherits cooldown window
+      Cooldown.push_back(cd);
     }
     Mr.push_back(Mr[irow]);
 
@@ -571,6 +596,9 @@ List hourly_step_core_cpp(IntegerMatrix grid,
     death_resource.push_back(0);
     death_random.push_back(0);
     death_timeout.push_back(0);
+    // Keep need-related vectors in sync with row count (will be filled later)
+    need_hour.push_back(NA_REAL);
+    need_over_g_hour.push_back(NA_REAL);
 
     // Resize K (n+1 x 22)
     IntegerMatrix Knew(new_n, 22);
@@ -625,6 +653,11 @@ List hourly_step_core_cpp(IntegerMatrix grid,
     DivisionTime[irow] = 1.0 / rv;
     TimeToDivide[irow] = DivisionTime[irow] - (double)Time[irow];
   }
+    // Precompute per-row hourly minimum survival need (need_i = frac * G[i]) for alive rows
+  for (int irow = 0; irow < n; ++irow) if (Status[irow] == 1) {
+    const double frac = (Label[irow] == 1) ? DTr : DNr;
+    need_hour[irow] = frac * G[irow];
+  }
 
   // (E) Death updates
   // First compute per-cell hourly glucose allocation g_alloc[i]
@@ -635,30 +668,21 @@ List hourly_step_core_cpp(IntegerMatrix grid,
   std::string mode_lc = supply_mode;
   std::transform(mode_lc.begin(), mode_lc.end(), mode_lc.begin(), ::tolower);
   if (alive_cnt > 0) {
-    if (mode_lc == "proportional") {
-      // --- Rank-based culling under proportional mode ---
-      // Each alive cell has a "need" = frac_i * G[i].
-      // Tie-break policy: random tie-break among equal-need cells using a shuffled order before a stable sort.
-      // If total need exceeds supply, we cull the largest-need cells first
-      // (ties broken at random) until the remaining total need fits the supply.
-      // This enforces that high-demand cells are more vulnerable under scarcity.
-
-      // 1) Collect alive indices and compute per-cell need
+    // --- Probabilistic inverse-need retention: global Bernoulli scheme with bisection ---
+    if (mode_lc == "proportional_prob") {
+      // (1) Collect all alive rows’ minimum survival need
       std::vector<int> alive_idx; alive_idx.reserve(alive_cnt);
       std::vector<double> need;   need.reserve(alive_cnt);
       double total_need = 0.0;
       for (int irow = 0; irow < n; ++irow) if (Status[irow] == 1) {
         const double frac = (Label[irow] == 1) ? DTr : DNr;
-        const double nd = frac * G[irow];
+        const double nd   = frac * G[irow];
         alive_idx.push_back(irow);
         need.push_back(nd);
         total_need += nd;
       }
-
-      // 2) If feasible, nobody dies
+      // (2) If feasible, keep everyone
       if (total_need <= total_supply) {
-        // Keep g_alloc as already computed (proportional to G/total_G)
-        // If total_G > 0, assign proportional allocation; else split equally
         if (total_G > 0) {
           for (int irow = 0; irow < n; ++irow) if (Status[irow] == 1) {
             g_alloc[irow] = total_supply * (G[irow] / total_G);
@@ -667,44 +691,193 @@ List hourly_step_core_cpp(IntegerMatrix grid,
           double base = total_supply / static_cast<double>(alive_cnt);
           for (int irow = 0; irow < n; ++irow) if (Status[irow] == 1) g_alloc[irow] = base;
         }
-        // Nothing else to do here.
       } else {
-        // 3) Sort by need ASC with random tie-break to avoid systematic bias
-        //    We shuffle first, then stable-sort by need.
-        {
-          std::random_device rd2;
-          std::mt19937 gen2(rd2());
-          std::shuffle(alive_idx.begin(), alive_idx.end(), gen2);
+        // (3) Bisection for c: solve sum(min(need_i, c)) = total_supply
+        double lo = 0.0, hi = 0.0;
+        for (size_t k = 0; k < need.size(); ++k) if (need[k] > hi) hi = need[k];
+        double S = total_supply;
+        double c = 0.0;
+        for (int iter = 0; iter < 60; ++iter) {
+          c = 0.5 * (lo + hi);
+          double tot = 0.0;
+          for (size_t k = 0; k < need.size(); ++k) tot += std::min(need[k], c);
+          if (tot > S) hi = c; else lo = c;
         }
-        // Build pair (idx, need) using the shuffled order
-        std::vector<std::pair<int,double>> pairs; pairs.reserve(alive_idx.size());
+        c = 0.5 * (lo + hi);
+        // (4) For each alive row, compute p_i = min(1, c/need_i) (1 if need_i<=0), draw U~Unif(0,1), keep if U <= p_i
+        std::vector<char> keep(n, 0);
         for (size_t k = 0; k < alive_idx.size(); ++k) {
           int irow = alive_idx[k];
-          const double frac = (Label[irow] == 1) ? DTr : DNr;
-          pairs.emplace_back(irow, frac * G[irow]);
-        }
-        std::stable_sort(pairs.begin(), pairs.end(),
-                         [](const std::pair<int,double>& a, const std::pair<int,double>& b){
-                           return a.second < b.second; // ascending by need
-                         });
-
-        // 4) Keep smallest needs until capacity; mark the rest as dead (resource)
-        double cum_need = 0.0;
-        std::vector<char> keep(n, 0);
-        for (size_t k = 0; k < pairs.size(); ++k) {
-          int irow = pairs[k].first;
-          double nd = pairs[k].second;
-          if (cum_need + nd <= total_supply) {
+          double nd = need[k];
+          double p_i = (nd <= 0.0) ? 1.0 : std::min(1.0, c / nd);
+          double U = unif_rand();
+          if (U <= p_i) {
             keep[irow] = 1;
-            cum_need += nd;
           } else {
-            keep[irow] = 0;
+            // Mark resource death
+            int gx = X[irow], gy = Y[irow];
+            if (gx >= 1 && gx <= N && gy >= 1 && gy <= N) {
+              int gid = grid(gx - 1, gy - 1);
+              if (!IntegerVector::is_na(gid) && gid == id[irow]) grid(gx - 1, gy - 1) = NA_INTEGER;
+            }
+            Status[irow] = 0;
+            death_event[irow] = 1;
+            death_resource[irow] = 1;
+            death_random[irow] = 0;
+            death_timeout[irow] = 0;
+            g_alloc[irow] = 0.0;
           }
         }
+        // (5) Proportional re-assignment among survivors
+        double total_G_surv = 0.0;
+        for (int irow = 0; irow < n; ++irow) if (Status[irow] == 1) total_G_surv += G[irow];
+        if (total_G_surv > 0) {
+          for (int irow = 0; irow < n; ++irow) if (Status[irow] == 1) {
+            g_alloc[irow] = total_supply * (G[irow] / total_G_surv);
+          }
+        }
+      }
 
-        // 5) Apply deaths for those not kept
-        for (size_t k = 0; k < pairs.size(); ++k) {
-          int irow = pairs[k].first;
+    // --- Probabilistic inverse-need retention: type-wise Bernoulli with bisection per type ---
+    } else if (mode_lc == "proportional_typewise_prob") {
+      // (1) Split alive rows into tumour and normal, compute need_i and sum_need_T, sum_need_N
+      std::vector<int> idx_T; idx_T.reserve(alive_cnt);
+      std::vector<int> idx_N; idx_N.reserve(alive_cnt);
+      std::vector<double> need_T; need_T.reserve(alive_cnt);
+      std::vector<double> need_N; need_N.reserve(alive_cnt);
+      double sum_need_T = 0.0, sum_need_N = 0.0;
+      for (int irow = 0; irow < n; ++irow) if (Status[irow] == 1) {
+        const double frac = (Label[irow] == 1) ? DTr : DNr;
+        const double nd   = frac * G[irow];
+        if (Label[irow] == 1) { idx_T.push_back(irow); need_T.push_back(nd); sum_need_T += nd; }
+        else                   { idx_N.push_back(irow); need_N.push_back(nd); sum_need_N += nd; }
+      }
+      const double eps = 1e-12;
+      const double denom = std::max(eps, sum_need_T + sum_need_N);
+      // (2) Allocate type shares
+      double share_T = total_supply * (sum_need_T / denom);
+      double share_N = total_supply - share_T;
+      // (3) For each type, bisection and Bernoulli keep as above
+      auto prob_keep_group = [&](const std::vector<int>& idxs,
+                                 const std::vector<double>& needs,
+                                 double share) {
+        std::vector<char> keep(n, 0);
+        double sum_need = 0.0; for (double v: needs) sum_need += v;
+        if (sum_need <= share) {
+          for (size_t k = 0; k < idxs.size(); ++k) keep[idxs[k]] = 1;
+          return keep;
+        }
+        double lo = 0.0, hi = 0.0;
+        for (size_t k = 0; k < needs.size(); ++k) if (needs[k] > hi) hi = needs[k];
+        double S = share;
+        double c = 0.0;
+        for (int iter = 0; iter < 60; ++iter) {
+          c = 0.5 * (lo + hi);
+          double tot = 0.0;
+          for (size_t k = 0; k < needs.size(); ++k) tot += std::min(needs[k], c);
+          if (tot > S) hi = c; else lo = c;
+        }
+        c = 0.5 * (lo + hi);
+        for (size_t k = 0; k < idxs.size(); ++k) {
+          int irow = idxs[k];
+          double nd = needs[k];
+          double p_i = (nd <= 0.0) ? 1.0 : std::min(1.0, c / nd);
+          double U = unif_rand();
+          if (U <= p_i) {
+            keep[irow] = 1;
+          } else {
+            // Mark resource death
+            int gx = X[irow], gy = Y[irow];
+            if (gx >= 1 && gx <= N && gy >= 1 && gy <= N) {
+              int gid = grid(gx - 1, gy - 1);
+              if (!IntegerVector::is_na(gid) && gid == id[irow]) grid(gx - 1, gy - 1) = NA_INTEGER;
+            }
+            Status[irow] = 0;
+            death_event[irow] = 1;
+            death_resource[irow] = 1;
+            death_random[irow] = 0;
+            death_timeout[irow] = 0;
+            g_alloc[irow] = 0.0;
+          }
+        }
+        return keep;
+      };
+      // (4) Apply probabilistic keep per type
+      std::vector<char> keep_T = prob_keep_group(idx_T, need_T, share_T);
+      std::vector<char> keep_N = prob_keep_group(idx_N, need_N, share_N);
+      // (5) After both types, assign g_alloc among all survivors proportionally
+      double total_G_surv = 0.0;
+      for (int irow = 0; irow < n; ++irow) if (Status[irow] == 1) total_G_surv += G[irow];
+      if (total_G_surv > 0) {
+        for (int irow = 0; irow < n; ++irow) if (Status[irow] == 1) {
+          g_alloc[irow] = total_supply * (G[irow] / total_G_surv);
+        }
+      }
+
+    // --- Type-wise deterministic rank-based culling ---
+    } else if (mode_lc == "proportional_typewise") {
+      // --- Type-wise rank-based culling ---
+      // 1) Split alive rows by type and compute per-cell minimum survival need
+      //    need_i = frac_i * G[i], where frac_i = DTr for tumour, DNr for normal.
+      std::vector<int> idx_T; idx_T.reserve(alive_cnt);
+      std::vector<int> idx_N; idx_N.reserve(alive_cnt);
+      std::vector<double> need_T; need_T.reserve(alive_cnt);
+      std::vector<double> need_N; need_N.reserve(alive_cnt);
+      double sum_need_T = 0.0, sum_need_N = 0.0;
+      for (int irow = 0; irow < n; ++irow) if (Status[irow] == 1) {
+        const double frac = (Label[irow] == 1) ? DTr : DNr;
+        const double nd   = frac * G[irow];
+        if (Label[irow] == 1) { idx_T.push_back(irow); need_T.push_back(nd); sum_need_T += nd; }
+        else                   { idx_N.push_back(irow); need_N.push_back(nd); sum_need_N += nd; }
+      }
+      const double eps = 1e-12;
+      const double denom = std::max(eps, sum_need_T + sum_need_N);
+      // 2) Allocate supply share per type in proportion to type-level need
+      double share_T = total_supply * (sum_need_T / denom);
+      double share_N = total_supply - share_T;
+
+      // Helper: cull within a type by ascending (need, id) with deterministic tie-break on id
+      auto cull_group = [&](const std::vector<int>& idxs,
+                             const std::vector<double>& needs,
+                             double share) {
+        struct Rec { double need; int id; int row; };
+        std::vector<Rec> recs; recs.reserve(idxs.size());
+        double sum_need = 0.0; for (double v: needs) sum_need += v;
+        if (sum_need <= share) {
+          // Everyone survives in this group; set g_alloc proportionally later
+          return std::vector<char>(); // empty => keep all
+        }
+        for (size_t k = 0; k < idxs.size(); ++k) {
+          int irow = idxs[k];
+          recs.push_back(Rec{needs[k], id[irow], irow});
+        }
+        std::stable_sort(recs.begin(), recs.end(), [](const Rec& a, const Rec& b){
+          if (a.need < b.need) return true;
+          if (a.need > b.need) return false;
+          return a.id < b.id; // deterministic tie-break
+        });
+        std::vector<char> keep(n, 0);
+        double cum = 0.0;
+        for (size_t k = 0; k < recs.size(); ++k) {
+          if (cum + recs[k].need <= share) {
+            keep[recs[k].row] = 1;
+            cum += recs[k].need;
+          } else {
+            keep[recs[k].row] = 0;
+          }
+        }
+        return keep;
+      };
+
+      // 3) Apply culling per type (if needed)
+      std::vector<char> keep_T = cull_group(idx_T, need_T, share_T);
+      std::vector<char> keep_N = cull_group(idx_N, need_N, share_N);
+
+      // 4) Execute deaths for rows not kept (only when keep vectors are non-empty)
+      auto kill_unkept = [&](const std::vector<int>& idxs, const std::vector<char>& keep){
+        if (keep.empty()) return; // means all kept
+        for (size_t k = 0; k < idxs.size(); ++k) {
+          int irow = idxs[k];
           if (keep[irow] == 0) {
             int gx = X[irow], gy = Y[irow];
             if (gx >= 1 && gx <= N && gy >= 1 && gy <= N) {
@@ -716,21 +889,97 @@ List hourly_step_core_cpp(IntegerMatrix grid,
             death_resource[irow] = 1;
             death_random[irow] = 0;
             death_timeout[irow] = 0;
-            g_alloc[irow] = 0.0; // no allocation for culled rows
+            g_alloc[irow] = 0.0;
           }
         }
+      };
+      kill_unkept(idx_T, keep_T);
+      kill_unkept(idx_N, keep_N);
 
-        // 6) Optionally recompute g_alloc for survivors as proportional among survivors
+      // 5) Proportional re-assignment of g_alloc among survivors
+      double total_G_surv = 0.0;
+      for (int irow = 0; irow < n; ++irow) if (Status[irow] == 1) total_G_surv += G[irow];
+      if (total_G_surv > 0) {
+        for (int irow = 0; irow < n; ++irow) if (Status[irow] == 1) {
+          g_alloc[irow] = total_supply * (G[irow] / total_G_surv);
+        }
+      }
+
+    // --- Global deterministic rank-based culling ---
+    } else if (mode_lc == "proportional") {
+      // --- Global rank-based culling (deterministic ties by id) ---
+      // 1) Collect alive indices and per-cell minimum survival need
+      std::vector<int> alive_idx; alive_idx.reserve(alive_cnt);
+      std::vector<double> need;   need.reserve(alive_cnt);
+      double total_need = 0.0;
+      for (int irow = 0; irow < n; ++irow) if (Status[irow] == 1) {
+        const double frac = (Label[irow] == 1) ? DTr : DNr;
+        const double nd   = frac * G[irow];
+        alive_idx.push_back(irow);
+        need.push_back(nd);
+        total_need += nd;
+      }
+      // 2) If feasible, nobody dies
+      if (total_need <= total_supply) {
+        if (total_G > 0) {
+          for (int irow = 0; irow < n; ++irow) if (Status[irow] == 1) {
+            g_alloc[irow] = total_supply * (G[irow] / total_G);
+          }
+        } else {
+          double base = total_supply / static_cast<double>(alive_cnt);
+          for (int irow = 0; irow < n; ++irow) if (Status[irow] == 1) g_alloc[irow] = base;
+        }
+      } else {
+        // 3) Deterministic stable sort by (need asc, id asc)
+        struct Rec { double need; int id; int row; };
+        std::vector<Rec> pairs; pairs.reserve(alive_idx.size());
+        for (size_t k = 0; k < alive_idx.size(); ++k) {
+          int irow = alive_idx[k];
+          pairs.push_back(Rec{need[k], id[irow], irow});
+        }
+        std::stable_sort(pairs.begin(), pairs.end(), [](const Rec& a, const Rec& b){
+          if (a.need < b.need) return true;
+          if (a.need > b.need) return false;
+          return a.id < b.id;
+        });
+        // 4) Keep the smallest needs until capacity; mark the rest as dead
+        double cum_need = 0.0;
+        std::vector<char> keep(n, 0);
+        for (size_t k = 0; k < pairs.size(); ++k) {
+          int irow = pairs[k].row;
+          if (cum_need + pairs[k].need <= total_supply) {
+            keep[irow] = 1;
+            cum_need += pairs[k].need;
+          } else {
+            keep[irow] = 0;
+          }
+        }
+        for (size_t k = 0; k < pairs.size(); ++k) {
+          int irow = pairs[k].row;
+          if (keep[irow] == 0) {
+            int gx = X[irow], gy = Y[irow];
+            if (gx >= 1 && gx <= N && gy >= 1 && gy <= N) {
+              int gid = grid(gx - 1, gy - 1);
+              if (!IntegerVector::is_na(gid) && gid == id[irow]) grid(gx - 1, gy - 1) = NA_INTEGER;
+            }
+            Status[irow] = 0;
+            death_event[irow] = 1;
+            death_resource[irow] = 1;
+            death_random[irow] = 0;
+            death_timeout[irow] = 0;
+            g_alloc[irow] = 0.0;
+          }
+        }
+        // 5) Recompute g_alloc among survivors proportionally
         double total_G_surv = 0.0;
         for (int irow = 0; irow < n; ++irow) if (Status[irow] == 1) total_G_surv += G[irow];
         if (total_G_surv > 0) {
           for (int irow = 0; irow < n; ++irow) if (Status[irow] == 1) {
             g_alloc[irow] = total_supply * (G[irow] / total_G_surv);
           }
-        } else {
-          // no survivors; nothing to reassign
         }
       }
+    // --- Equal allocation mode ---
     } else {
       // equal mode
       double base = total_supply / static_cast<double>(alive_cnt);
@@ -741,9 +990,12 @@ List hourly_step_core_cpp(IntegerMatrix grid,
   // Proportional mode: compare g_alloc[i] to (DTr/DNr) * G[i] (cell-specific).
   // Equal mode: compare equal base allocation to (DTr/DNr) * G[i].
   if (alive_cnt > 0) {
-    if (mode_lc == "proportional") {
-      // (resource-based deaths already handled in rank-based culling above)
+    // For all proportional and typewise (deterministic or probabilistic) modes, resource deaths already handled above.
+    if (mode_lc == "proportional" || mode_lc == "proportional_prob" ||
+        mode_lc == "proportional_typewise" || mode_lc == "proportional_typewise_prob") {
+      // already handled in their respective branches
     } else {
+      // equal mode
       const double base = total_supply / static_cast<double>(alive_cnt); // absolute supply per cell
       for (int irow = 0; irow < n; ++irow) if (Status[irow] == 1) {
         const double frac = (Label[irow] == 1) ? DTr : DNr;
@@ -807,7 +1059,18 @@ List hourly_step_core_cpp(IntegerMatrix grid,
       }
     }
   }
-
+    // Compute pressure metric need_over_g for all rows (Inf when g_alloc==0 and need is finite)
+  for (int irow = 0; irow < n; ++irow) {
+    double nd = need_hour[irow];
+    double ga = g_alloc[irow];
+    if (Rcpp::NumericVector::is_na(nd)) {
+      need_over_g_hour[irow] = NA_REAL;
+    } else if (ga <= 0.0) {
+      need_over_g_hour[irow] = R_PosInf;
+    } else {
+      need_over_g_hour[irow] = nd / ga;
+    }
+  }
   // Return updated state
   return List::create(
     _["grid"] = grid,
@@ -820,11 +1083,14 @@ List hourly_step_core_cpp(IntegerMatrix grid,
     _["Time"] = Time,
     _["DivisionTime"] = DivisionTime,
     _["TimeToDivide"] = TimeToDivide,
+    _["Cooldown"] = Cooldown,
     _["r"] = r,
     _["f"] = f,
     _["G"] = G,
     _["Mr"] = Mr,
     _["K"] = K,
+    _["need"] = need_hour,
+    _["need_over_g"] = need_over_g_hour,
     _["max_id"] = max_id,
     _["g_alloc"] = g_alloc,
     _["div_event"] = div_event,

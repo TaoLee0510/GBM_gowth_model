@@ -1,8 +1,21 @@
+# -----------------------------------------------------------------------------
+# Quick reference for `supply_mode`
+#   equal                       : Baseline — equal split; simple & fast. Good baseline.
+#   proportional                : Global deterministic rank-based culling (strong selection, no randomness). Useful for upper-bound / strongest-selection analysis.
+#   proportional_typewise       : Deterministic culling per type (fair across types + strong selection). Prevents one type from being completely eliminated.
+#   proportional_prob           : Global probabilistic retention via inverse-need Bernoulli (smooth, includes randomness). Helpful for estimating P(g) and D(g).
+#   proportional_typewise_prob  : Probabilistic retention per type (recommended default: cross-type fairness + smooth & robust).
+#
+# Terminology:
+#   need = frac × G; for tumor cells frac = DTr, for normal cells frac = DNr.
+#   When resources are insufficient, cells with larger `need` are less likely to be retained.
+# -----------------------------------------------------------------------------
 Nd: 100                        # grid
 Ctd: 5                         # assumed tumor cells Glu absorbing rate over noralmal cells
 Rt: 0.02                       # initial tumor cells growth rate
 Rn: 0.02                       # normal cells growth rate
 N_division_possibility: 0.001  # Normal cell division possibility(every 1 hour) 
+CooldownFactor: 5               # Cooldown multiplier (× DivisionTime) for normal cells; 0 disables cooldown
 Cg: 1.0                        # Normal cell Glu absorbing
 m: 0.60                        # Normal cell density
 N_death_rate: 0.004            # Normal cell death rate(every 24 hours) 
@@ -12,8 +25,8 @@ Mnr: 0.0005                       # Migration normal cells rate
 Mtr: 0.0025                       # Migration tumor cells rate  
 radius: 2                      # radius
 total_supply: "0.1,0.25,0.5,1,2"                   # total supply of Glu
-DTr: 0.02                      # tumor cells Glu death proportion
-DNr: 0.001                      # normal cells Glu death proportion
-supply_mode: Proportional   # resource allocation: 'proportional' or 'equal'
+DTr: 0.2                      # tumor cells Glu death proportion
+DNr: 0.05                      # normal cells Glu death proportion
+supply_mode: proportional_typewise_prob   # resource allocation: "proportional","equal", "proportional_typewise", "proportional_prob", "proportional_typewise_prob"
 replicates: 5                  # number of replicates
 Time: 17280                 # total simulation time in hours (termination criterion)

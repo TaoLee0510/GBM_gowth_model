@@ -1,4 +1,4 @@
-base_output <- "/Users/4482173/Library/CloudStorage/OneDrive-MoffittCancerCenter/GitHub/GBM_gowth_model"
+base_output <- "/Users/4482173/Documents/Project/GBM_Model"
 
 source("/Users/4482173/Library/CloudStorage/OneDrive-MoffittCancerCenter/GitHub/GBM_gowth_model/fit_PD.R")
 #
@@ -12,18 +12,18 @@ fit_PD_from_results(file.path(base_output, "Results"),
                     death_mode = "resource_only")              # c("resource_only", "all", "random_only", "timeout_only")
 
 # 2) Or manually read the events data for one supply and fit:
-ev <- read_events_dir(file.path(base_output, "Results", "1", "Sim_001", "events"))
-fit_PD_from_events(ev, out_prefix = file.path(base_output, "Results", "1", "Sim_001", "PD_fit_single"))
+ev <- read_events_dir(file.path(base_output, "Results", "0.1", "Sim_001", "events"))
+fit_PD_from_events(ev, out_prefix = file.path(base_output, "Results", "0.1", "Sim_001", "PD_fit_single"),bins = 100)
 
 
 
-base_output <- "/Users/4482173/Library/CloudStorage/OneDrive-MoffittCancerCenter/GitHub/GBM_gowth_model"
+base_output <- "/Users/4482173/Documents/Project/GBM_Model"
 summarize_PD_all(
   results_root   = file.path(base_output, "Results"),
   exclude_daily  = TRUE,
-  bins           = 30,
+  bins           = 100,
   fit_gam        = TRUE,
-  fd             = 1.0,
+  fd             = NA,
   rt             = 0.02,
   death_mode     = "resource_only",  # or "all" / "random_only" / "timeout_only"
   g_points       = 200,
