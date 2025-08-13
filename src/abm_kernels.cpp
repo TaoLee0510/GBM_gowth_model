@@ -519,30 +519,48 @@ List hourly_step_core_cpp(IntegerMatrix grid,
     div_event[irow] = 1;
 
     // MS and fitness for both daughters
-    IntegerVector kt1, kt2; double f1v = f[irow], f2v = f[irow];
+    IntegerVector kt1, kt2;
+    double f1v = f[irow], f2v = f[irow];
     apply_ms(irow, kt1, kt2, f1v, f2v);
+
+    // Determine cell type
+    bool is_tumor = (Label[irow] == 1);
 
     // Update mother in place -> daughter #1
     for (int c = 0; c < 22; ++c) K(irow, c) = kt1[c];
-    f[irow]  = f1v;
-    G[irow]  = Ctd * f1v;
+    if (is_tumor) {
+      // Tumor uses MS-derived fitness and tumor glucose rule
+      f[irow]  = f1v;
+      G[irow]  = Ctd * f1v;
+    } else {
+      // Normal keeps baseline fitness and uses normal glucose Cg
+      // (ignore MS-derived fitness for normals)
+      f[irow]  = f[irow];  // keep baseline (typically 1.0)
+      G[irow]  = Cg;
+      division[irow] = 0;  // normal mother leaves divisible state after division
+    }
     Time[irow] = 0;
-    if (Label[irow] == 0) division[irow] = 0; // normal mothers exit the divisible state after division
 
     // Append daughter #2 as a new row
-    // Resize all column vectors by +1
     int new_n = n + 1;
     id.push_back(new_id);
     X.push_back(dx); Y.push_back(dy);
     Label.push_back(Label[irow]);
     Status.push_back(1);
-    division.push_back( (Label[irow] == 0) ? 0 : 1 );
+    division.push_back( is_tumor ? 1 : 0 );
     Time.push_back(0);
     DivisionTime.push_back(0.0);
     TimeToDivide.push_back(0.0);
     r.push_back(0.0);
-    f.push_back(f2v);
-    G.push_back(Ctd * f2v);
+    if (is_tumor) {
+      // Tumor daughter uses MS-derived fitness and tumor glucose rule
+      f.push_back(f2v);
+      G.push_back(Ctd * f2v);
+    } else {
+      // Normal daughter keeps baseline fitness and uses normal glucose Cg
+      f.push_back(f[irow]);
+      G.push_back(Cg);
+    }
     Mr.push_back(Mr[irow]);
 
     // Extend per-hour allocation & event flags to keep vector sizes consistent
