@@ -36,6 +36,7 @@ read_config <- function(path) {
   cfg_raw$T_death_rate <- as.numeric(cfg_raw$T_death_rate)
   cfg_raw$MSR <- as.numeric(cfg_raw$MSR)
   cfg_raw$radius <- as.numeric(cfg_raw$radius)
+  cfg_raw$CooldownFactor <- as.numeric(cfg_raw$CooldownFactor %||% 5)
   # Parse total_supply as vector: accept numeric, YAML seq, or comma-separated string
   ts_raw <- cfg_raw$total_supply
   if (is.null(ts_raw)) {
@@ -109,7 +110,8 @@ init_cells <- function(cfg, karyolib) {
       Status = 1L,
       Mr  = mr,
       TimeToDivide = 0,
-      division = ifelse(label == 1L, 1L, 0L)
+      division = ifelse(label == 1L, 1L, 0L),
+      Cooldown = 0
     )
   }
 
@@ -389,6 +391,7 @@ run_simulation_cfg <- function(cfg, karyolib, outputdir, prefix = "Cells", globa
       Time  = Cells$Time,
       DivisionTime = Cells$DivisionTime,
       TimeToDivide = Cells$TimeToDivide,
+      Cooldown = Cells$Cooldown,
       r = Cells$r,
       f = Cells$f,
       G = Cells$G,
@@ -397,7 +400,7 @@ run_simulation_cfg <- function(cfg, karyolib, outputdir, prefix = "Cells", globa
       Rt = cfg$Rt, Rn = cfg$Rn, Cg = cfg$Cg, Fd = cfg$Fd, Tg = cfg$Tg,
       radius = cfg$radius, N_division_possibility = cfg$N_division_possibility,
       T_death_rate = cfg$T_death_rate, N_death_rate = cfg$N_death_rate,
-      total_supply = cfg$total_supply, DTr = cfg$DTr, DNr = cfg$DNr, supply_mode = cfg$supply_mode, MSR = cfg$MSR, Ctd = cfg$Ctd,
+      total_supply = cfg$total_supply, DTr = cfg$DTr, DNr = cfg$DNr, supply_mode = cfg$supply_mode, MSR = cfg$MSR, Ctd = cfg$Ctd, CooldownFactor = cfg$CooldownFactor,
       step = step, N = cfg$N, max_id = id_state$max_id,
       karyo_lib_str = karyolib$karyotype,
       karyo_lib_fit = karyolib$fitness
@@ -419,6 +422,7 @@ run_simulation_cfg <- function(cfg, karyolib, outputdir, prefix = "Cells", globa
       Mr = as.numeric(res$Mr),
       TimeToDivide = as.numeric(res$TimeToDivide),
       division = as.integer(res$division),
+      Cooldown = as.numeric(res$Cooldown),
       g_alloc = as.numeric(res$g_alloc),
       div_event = as.integer(res$div_event),
       death_event = as.integer(res$death_event),
@@ -465,7 +469,7 @@ run_simulation_cfg <- function(cfg, karyolib, outputdir, prefix = "Cells", globa
 
       # Plot PNG (living cells only), no axes; Label=1 red, Label=0 green
       png(filename = png_path, width = 1000, height = 1000, units = "px")
-      op <- par(mar = c(0, 0, 0, 0))
+      op <- par(mar = c(0, 0, 0, 0), oma = c(0, 0, 2, 0), pty = "s")
       plot(NA, xlim = c(1, cfg$N), ylim = c(1, cfg$N), axes = FALSE, xlab = "", ylab = "", asp = 1)
       if (nrow(Cells_live) > 0) {
         idx_norm <- which(Cells_live$Label == 0L)
@@ -473,6 +477,11 @@ run_simulation_cfg <- function(cfg, karyolib, outputdir, prefix = "Cells", globa
         if (length(idx_norm)) points(Cells_live$X[idx_norm], Cells_live$Y[idx_norm], pch = 16, cex = 1.5, col = "green")
         if (length(idx_tum))  points(Cells_live$X[idx_tum],  Cells_live$Y[idx_tum],  pch = 16, cex = 1.5, col = "red")
       }
+      # Build title "total_supply: XX  Day:XX" with left alignment; use supply ratio for XX
+      title_txt <- sprintf("total supply factor: %s  Day:%d",
+                           format(signif(cfg$total_supply / (cfg$N * cfg$N), 6), trim = TRUE),
+                           day_index)
+      mtext(title_txt, side = 3, line = 0.5, adj = 0, outer = TRUE, cex = 1.2)
       par(op); dev.off()
 
       # Flush hourly events collected for the past day
@@ -539,6 +548,7 @@ run_ABM_simulation <- function(cfg_file, karyolib_file, base_output, workers = m
       supply_value = vapply(jobs, function(j) j$cfg$total_supply, numeric(1)),
       supply_ratio = vapply(jobs, function(j) j$cfg$total_supply / (cfg0$N * cfg0$N), numeric(1)),
       supply_label = vapply(jobs, function(j) basename(dirname(j$out_dir)), character(1)),
+      CooldownFactor = vapply(jobs, function(j) j$cfg$CooldownFactor, numeric(1)),
       replicate    = vapply(jobs, function(j) as.integer(j$global_id), integer(1)),
       global_id    = vapply(jobs, function(j) as.integer(j$global_id), integer(1)),
       out_dir      = vapply(jobs, function(j) j$out_dir, character(1)),
@@ -579,10 +589,14 @@ run_ABM_simulation <- function(cfg_file, karyolib_file, base_output, workers = m
       dir.create(job$out_dir, recursive = TRUE, showWarnings = FALSE)
       write.csv(
         data.frame(
+          supply_mode  = cfg_i$supply_mode,
           supply_value = cfg_i$total_supply,
           supply_ratio = as.numeric(cfg_i$total_supply) / (cfg_i$N * cfg_i$N),
+          supply_label = basename(dirname(job$out_dir)),
+          CooldownFactor = cfg_i$CooldownFactor,
           replicate    = as.integer(job$global_id),
           global_id    = as.integer(job$global_id),
+          out_dir      = job$out_dir,
           prefix       = job$prefix
         ),
         file = file.path(job$out_dir, "job_info.csv"), row.names = FALSE

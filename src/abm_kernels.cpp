@@ -392,6 +392,7 @@ List hourly_step_core_cpp(IntegerMatrix grid,
                      IntegerVector Time,
                      NumericVector DivisionTime,
                      NumericVector TimeToDivide,
+                     NumericVector Cooldown,
                      NumericVector r,
                      NumericVector f,
                      NumericVector G,
@@ -400,7 +401,7 @@ List hourly_step_core_cpp(IntegerMatrix grid,
                      double Rt, double Rn, double Cg, double Fd, double Tg,
                      int radius, double N_division_possibility,
                      double T_death_rate, double N_death_rate,
-                     double total_supply, double DTr, double DNr, std::string supply_mode, double MSR, double Ctd,
+                     double total_supply, double DTr, double DNr, std::string supply_mode, double MSR, double Ctd, double CooldownFactor,
                      int step, int N, int max_id,
                      CharacterVector karyo_lib_str,
                      NumericVector  karyo_lib_fit) {
@@ -456,6 +457,7 @@ List hourly_step_core_cpp(IntegerMatrix grid,
     if (Status[irow] != 1) continue;
     if (Label[irow] != 0) continue; // only normal
     if (division[irow] != 0) continue;
+    if (Cooldown[irow] > 0.0) continue; // still cooling down
     auto nb = nb_counts_row(irow);
     int Nt = nb.first;
     // Only activate if tumour neighbours exist; no baseline activation when Nt==0
@@ -472,7 +474,14 @@ List hourly_step_core_cpp(IntegerMatrix grid,
   }
 
   // (B) Advance clocks by 1 hour for all alive cells
-  for (int irow = 0; irow < n; ++irow) if (Status[irow] == 1) Time[irow] += 1;
+  for (int irow = 0; irow < n; ++irow) {
+    if (Status[irow] == 1) {
+      Time[irow] += 1;
+      if (Cooldown[irow] > 0.0) {
+        Cooldown[irow] = std::max(0.0, Cooldown[irow] - 1.0);
+      }
+    }
+  }
 
   // (C) Division attempts: collect ready rows and shuffle
   std::vector<int> ready;
@@ -528,16 +537,26 @@ List hourly_step_core_cpp(IntegerMatrix grid,
 
     // Update mother in place -> daughter #1
     for (int c = 0; c < 22; ++c) K(irow, c) = kt1[c];
+    double cd = 0.0;
     if (is_tumor) {
       // Tumor uses MS-derived fitness and tumor glucose rule
       f[irow]  = f1v;
       G[irow]  = Ctd * f1v;
+      // Tumor cooldown remains 0
+      Cooldown[irow] = 0.0;
     } else {
       // Normal keeps baseline fitness and uses normal glucose Cg
       // (ignore MS-derived fitness for normals)
       f[irow]  = f[irow];  // keep baseline (typically 1.0)
       G[irow]  = Cg;
       division[irow] = 0;  // normal mother leaves divisible state after division
+      // Cooldown = CooldownFactor × cycle time; if CooldownFactor==0, disable cooldown
+      if (CooldownFactor > 0.0) {
+        cd = CooldownFactor * DivisionTime[irow];
+      } else {
+        cd = 0.0;
+      }
+      Cooldown[irow] = cd;
     }
     Time[irow] = 0;
 
@@ -556,10 +575,13 @@ List hourly_step_core_cpp(IntegerMatrix grid,
       // Tumor daughter uses MS-derived fitness and tumor glucose rule
       f.push_back(f2v);
       G.push_back(Ctd * f2v);
+      Cooldown.push_back(0.0);
     } else {
       // Normal daughter keeps baseline fitness and uses normal glucose Cg
       f.push_back(f[irow]);
       G.push_back(Cg);
+      // For normals, daughter inherits cooldown window
+      Cooldown.push_back(cd);
     }
     Mr.push_back(Mr[irow]);
 
@@ -820,6 +842,7 @@ List hourly_step_core_cpp(IntegerMatrix grid,
     _["Time"] = Time,
     _["DivisionTime"] = DivisionTime,
     _["TimeToDivide"] = TimeToDivide,
+    _["Cooldown"] = Cooldown,
     _["r"] = r,
     _["f"] = f,
     _["G"] = G,

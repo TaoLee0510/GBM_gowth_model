@@ -3,6 +3,7 @@ Ctd: 5                         # assumed tumor cells Glu absorbing rate over nor
 Rt: 0.02                       # initial tumor cells growth rate
 Rn: 0.02                       # normal cells growth rate
 N_division_possibility: 0.001  # Normal cell division possibility(every 1 hour) 
+CooldownFactor: 5               # Cooldown multiplier (× DivisionTime) for normal cells; 0 disables cooldown
 Cg: 1.0                        # Normal cell Glu absorbing
 m: 0.60                        # Normal cell density
 N_death_rate: 0.004            # Normal cell death rate(every 24 hours) 
@@ -12,8 +13,8 @@ Mnr: 0.0005                       # Migration normal cells rate
 Mtr: 0.0025                       # Migration tumor cells rate  
 radius: 2                      # radius
 total_supply: "0.1,0.25,0.5,1,2"                   # total supply of Glu
-DTr: 0.02                      # tumor cells Glu death proportion
-DNr: 0.001                      # normal cells Glu death proportion
+DTr: 0.2                      # tumor cells Glu death proportion
+DNr: 0.05                      # normal cells Glu death proportion
 supply_mode: Proportional   # resource allocation: 'proportional' or 'equal'
 replicates: 5                  # number of replicates
 Time: 17280                 # total simulation time in hours (termination criterion)
