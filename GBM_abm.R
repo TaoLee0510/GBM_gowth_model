@@ -57,6 +57,10 @@ read_config <- function(path) {
   if (is.na(cfg_raw$total_supply)) cfg_raw$total_supply <- cfg_raw$N * cfg_raw$N
   if (is.na(cfg_raw$DTr)) cfg_raw$DTr <- 0.2
   if (is.na(cfg_raw$DNr)) cfg_raw$DNr <- 0.2
+  # Parse supply_mode (default "proportional", allow "equal")
+  mode <- tolower(as.character(cfg_raw$supply_mode %||% "proportional"))
+  if (!mode %in% c("proportional","equal")) mode <- "proportional"
+  cfg_raw$supply_mode <- mode
   # Replicates from YAML (default 1)
   cfg_raw$replicates <- as.integer(cfg_raw$replicates %||% 1L)
   if (is.na(cfg_raw$replicates) || cfg_raw$replicates < 1L) cfg_raw$replicates <- 1L
@@ -335,6 +339,9 @@ run_simulation_cfg <- function(cfg, karyolib, outputdir, prefix = "Cells", globa
   grid        <- init$grid
   id_state    <- list(max_id = init$max_id)
 
+  # Buffer for hourly events
+  events_buffer <- list()
+
   # initial per-id maps + bulk r
   maps <- build_id_maps(Cells)
   r_active <- calc_rates_all_cpp(grid,
@@ -390,7 +397,7 @@ run_simulation_cfg <- function(cfg, karyolib, outputdir, prefix = "Cells", globa
       Rt = cfg$Rt, Rn = cfg$Rn, Cg = cfg$Cg, Fd = cfg$Fd, Tg = cfg$Tg,
       radius = cfg$radius, N_division_possibility = cfg$N_division_possibility,
       T_death_rate = cfg$T_death_rate, N_death_rate = cfg$N_death_rate,
-      total_supply = cfg$total_supply, DTr = cfg$DTr, DNr = cfg$DNr, MSR = cfg$MSR, Ctd = cfg$Ctd,
+      total_supply = cfg$total_supply, DTr = cfg$DTr, DNr = cfg$DNr, supply_mode = cfg$supply_mode, MSR = cfg$MSR, Ctd = cfg$Ctd,
       step = step, N = cfg$N, max_id = id_state$max_id,
       karyo_lib_str = karyolib$karyotype,
       karyo_lib_fit = karyolib$fitness
@@ -411,7 +418,14 @@ run_simulation_cfg <- function(cfg, karyolib, outputdir, prefix = "Cells", globa
       Status = as.integer(res$Status),
       Mr = as.numeric(res$Mr),
       TimeToDivide = as.numeric(res$TimeToDivide),
-      division = as.integer(res$division)
+      division = as.integer(res$division),
+      g_alloc = as.numeric(res$g_alloc),
+      div_event = as.integer(res$div_event),
+      death_event = as.integer(res$death_event),
+      risk_div     = as.integer(res$risk_div),
+      death_resource = as.integer(res$death_resource),
+      death_random   = as.integer(res$death_random),
+      death_timeout  = as.integer(res$death_timeout)
     )
     Cells$global_id <- as.integer(global_id)
 
@@ -420,6 +434,20 @@ run_simulation_cfg <- function(cfg, karyolib, outputdir, prefix = "Cells", globa
     for (j in 1:22) Cells[[paste0("K", j)]] <- K_mat[, j]
 
     id_state$max_id <- res$max_id
+
+    # Push per-hour events to buffer
+    events_buffer[[length(events_buffer) + 1L]] <- tibble::tibble(
+      step = step,
+      id   = Cells$id,
+      Label = Cells$Label,
+      g_alloc = Cells$g_alloc,
+      div_event = Cells$div_event,
+      death_event = Cells$death_event,
+      risk_div = Cells$risk_div,
+      death_resource = Cells$death_resource,
+      death_random   = Cells$death_random,
+      death_timeout  = Cells$death_timeout
+    )
 
     # Daily snapshot
     if (step %% 24L == 0L) {
@@ -442,10 +470,20 @@ run_simulation_cfg <- function(cfg, karyolib, outputdir, prefix = "Cells", globa
       if (nrow(Cells_live) > 0) {
         idx_norm <- which(Cells_live$Label == 0L)
         idx_tum  <- which(Cells_live$Label == 1L)
-        if (length(idx_norm)) points(Cells_live$X[idx_norm], Cells_live$Y[idx_norm], pch = 16, cex = 0.8, col = "green")
-        if (length(idx_tum))  points(Cells_live$X[idx_tum],  Cells_live$Y[idx_tum],  pch = 16, cex = 0.8, col = "red")
+        if (length(idx_norm)) points(Cells_live$X[idx_norm], Cells_live$Y[idx_norm], pch = 16, cex = 1.5, col = "green")
+        if (length(idx_tum))  points(Cells_live$X[idx_tum],  Cells_live$Y[idx_tum],  pch = 16, cex = 1.5, col = "red")
       }
       par(op); dev.off()
+
+      # Flush hourly events collected for the past day
+      if (length(events_buffer) > 0) {
+        ev_dir <- file.path(outputdir, "events")
+        dir.create(ev_dir, showWarnings = FALSE, recursive = TRUE)
+        ev_tbl <- dplyr::bind_rows(events_buffer)
+        ev_path <- sprintf(paste0(ev_dir, "/%s_day%03d_events.csv"), prefix, day_index)
+        write.csv(ev_tbl, ev_path, row.names = FALSE)
+        events_buffer <- list()
+      }
 
       # Log message
       cat("Day", day_index, ":", nrow(Cells_live), "living cells saved\n")
@@ -497,6 +535,7 @@ run_ABM_simulation <- function(cfg_file, karyolib_file, base_output, workers = m
   dir.create(results_root, recursive = TRUE, showWarnings = FALSE)
   if (length(jobs) > 0) {
     manifest <- tibble::tibble(
+      supply_mode  = vapply(jobs, function(j) j$cfg$supply_mode, character(1)),
       supply_value = vapply(jobs, function(j) j$cfg$total_supply, numeric(1)),
       supply_ratio = vapply(jobs, function(j) j$cfg$total_supply / (cfg0$N * cfg0$N), numeric(1)),
       supply_label = vapply(jobs, function(j) basename(dirname(j$out_dir)), character(1)),
