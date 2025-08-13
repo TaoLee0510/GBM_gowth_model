@@ -54,6 +54,14 @@ fit_PD_from_events <- function(events_df,
     ) %>%
     filter(is.finite(g), g >= 0)
 
+      # Prefer pressure metric if available; fallback to g_alloc
+  g_label <- "g (per-hour glucose allocation)"
+  if ("need_over_g" %in% names(events_df)) {
+    df$g <- as.numeric(events_df$need_over_g)
+    df <- df %>% filter(is.finite(g), g >= 0)
+    g_label <- "need/g (pressure)"
+  }
+
   # For random-only death analysis we must NOT drop daily ticks
   local_exclude_daily <- if (death_mode == "random_only") FALSE else isTRUE(exclude_daily)
   if (local_exclude_daily) {
@@ -171,7 +179,7 @@ fit_PD_from_events <- function(events_df,
     p <- ggplot() +
       geom_point(data = bins_tbl, aes(x = g_mid, y = !!sym(P_col)), color = "#377eb8", alpha = 0.8, size = 2) +
       geom_point(data = bins_tbl, aes(x = g_mid, y = !!sym(D_col)), color = "#e41a1c", alpha = 0.8, size = 2) +
-      labs(x = "g (per-hour glucose allocation)", y = "rate per hour",
+      labs(x = g_label, y = "rate per hour",
            title = paste0("P(g) & D(g) - ", label_tag)) +
       theme_bw()
     if (!is.null(ggrid_tbl)) {

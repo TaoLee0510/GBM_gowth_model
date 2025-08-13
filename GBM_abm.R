@@ -284,7 +284,9 @@ run_simulation_cfg <- function(cfg, karyolib, outputdir, prefix = "Cells", globa
       risk_div     = as.integer(res$risk_div),
       death_resource = as.integer(res$death_resource),
       death_random   = as.integer(res$death_random),
-      death_timeout  = as.integer(res$death_timeout)
+      death_timeout  = as.integer(res$death_timeout),
+      need           = as.numeric(res$need),
+      need_over_g    = as.numeric(res$need_over_g)
     )
     Cells$global_id <- as.integer(global_id)
 
@@ -300,6 +302,8 @@ run_simulation_cfg <- function(cfg, karyolib, outputdir, prefix = "Cells", globa
       id   = Cells$id,
       Label = Cells$Label,
       g_alloc = Cells$g_alloc,
+      need = Cells$need,
+      need_over_g = Cells$need_over_g,
       div_event = Cells$div_event,
       death_event = Cells$death_event,
       risk_div = Cells$risk_div,

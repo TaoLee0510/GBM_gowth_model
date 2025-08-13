@@ -415,6 +415,9 @@ List hourly_step_core_cpp(IntegerMatrix grid,
   IntegerVector death_resource(n, 0);  // 1 if a resource-based death occurred this hour
   IntegerVector death_random(n, 0);    // 1 if a random (daily) death occurred this hour
   IntegerVector death_timeout(n, 0);   // 1 if a timeout death occurred this hour
+    // Per-hour need and pressure metric to export (distinct names to avoid shadowing locals)
+  NumericVector need_hour(n, NA_REAL);
+  NumericVector need_over_g_hour(n, NA_REAL);
 
   // Build id->row map (size max_id+1)
   IntegerVector id2row(max_id + 1, NA_INTEGER);
@@ -593,6 +596,9 @@ List hourly_step_core_cpp(IntegerMatrix grid,
     death_resource.push_back(0);
     death_random.push_back(0);
     death_timeout.push_back(0);
+    // Keep need-related vectors in sync with row count (will be filled later)
+    need_hour.push_back(NA_REAL);
+    need_over_g_hour.push_back(NA_REAL);
 
     // Resize K (n+1 x 22)
     IntegerMatrix Knew(new_n, 22);
@@ -646,6 +652,11 @@ List hourly_step_core_cpp(IntegerMatrix grid,
     double rv = r[irow]; if (rv < 1e-12) rv = 1e-12;
     DivisionTime[irow] = 1.0 / rv;
     TimeToDivide[irow] = DivisionTime[irow] - (double)Time[irow];
+  }
+    // Precompute per-row hourly minimum survival need (need_i = frac * G[i]) for alive rows
+  for (int irow = 0; irow < n; ++irow) if (Status[irow] == 1) {
+    const double frac = (Label[irow] == 1) ? DTr : DNr;
+    need_hour[irow] = frac * G[irow];
   }
 
   // (E) Death updates
@@ -1048,7 +1059,18 @@ List hourly_step_core_cpp(IntegerMatrix grid,
       }
     }
   }
-
+    // Compute pressure metric need_over_g for all rows (Inf when g_alloc==0 and need is finite)
+  for (int irow = 0; irow < n; ++irow) {
+    double nd = need_hour[irow];
+    double ga = g_alloc[irow];
+    if (Rcpp::NumericVector::is_na(nd)) {
+      need_over_g_hour[irow] = NA_REAL;
+    } else if (ga <= 0.0) {
+      need_over_g_hour[irow] = R_PosInf;
+    } else {
+      need_over_g_hour[irow] = nd / ga;
+    }
+  }
   // Return updated state
   return List::create(
     _["grid"] = grid,
@@ -1067,6 +1089,8 @@ List hourly_step_core_cpp(IntegerMatrix grid,
     _["G"] = G,
     _["Mr"] = Mr,
     _["K"] = K,
+    _["need"] = need_hour,
+    _["need_over_g"] = need_over_g_hour,
     _["max_id"] = max_id,
     _["g_alloc"] = g_alloc,
     _["div_event"] = div_event,
