@@ -58,9 +58,11 @@ read_config <- function(path) {
   if (is.na(cfg_raw$total_supply)) cfg_raw$total_supply <- cfg_raw$N * cfg_raw$N
   if (is.na(cfg_raw$DTr)) cfg_raw$DTr <- 0.2
   if (is.na(cfg_raw$DNr)) cfg_raw$DNr <- 0.2
-  # Parse supply_mode (default "proportional", allow "equal")
+  # Parse supply_mode (default "proportional", allow new probabilistic modes)
   mode <- tolower(as.character(cfg_raw$supply_mode %||% "proportional"))
-  if (!mode %in% c("proportional","equal")) mode <- "proportional"
+  # Allowed: deterministic, typewise, probabilistic, typewise probabilistic
+  allowed <- c("proportional","equal","proportional_typewise","proportional_prob","proportional_typewise_prob")  # includes new probabilistic modes
+  if (!mode %in% allowed) mode <- "proportional"
   cfg_raw$supply_mode <- mode
   # Replicates from YAML (default 1)
   cfg_raw$replicates <- as.integer(cfg_raw$replicates %||% 1L)
@@ -549,6 +551,15 @@ run_ABM_simulation <- function(cfg_file, karyolib_file, base_output, workers = m
       supply_ratio = vapply(jobs, function(j) j$cfg$total_supply / (cfg0$N * cfg0$N), numeric(1)),
       supply_label = vapply(jobs, function(j) basename(dirname(j$out_dir)), character(1)),
       CooldownFactor = vapply(jobs, function(j) j$cfg$CooldownFactor, numeric(1)),
+      suggested_use = vapply(jobs, function(j) {
+        switch(tolower(j$cfg$supply_mode),
+               equal = "Baseline: equal split; simple & fast",
+               proportional = "Strong selection (global deterministic culling); upper-bound analysis",
+               proportional_typewise = "Cross-type fairness + strong selection; avoids single-type wipeout",
+               proportional_prob = "Smooth probabilistic retention; good for estimating P(g)/D(g)",
+               proportional_typewise_prob = "Recommended default: cross-type fairness + smooth; robust estimation",
+               j$cfg$supply_mode)
+      }, character(1)),
       replicate    = vapply(jobs, function(j) as.integer(j$global_id), integer(1)),
       global_id    = vapply(jobs, function(j) as.integer(j$global_id), integer(1)),
       out_dir      = vapply(jobs, function(j) j$out_dir, character(1)),
@@ -594,6 +605,13 @@ run_ABM_simulation <- function(cfg_file, karyolib_file, base_output, workers = m
           supply_ratio = as.numeric(cfg_i$total_supply) / (cfg_i$N * cfg_i$N),
           supply_label = basename(dirname(job$out_dir)),
           CooldownFactor = cfg_i$CooldownFactor,
+          suggested_use = switch(tolower(cfg_i$supply_mode),
+                           equal = "Baseline: equal split; simple & fast",
+                           proportional = "Strong selection (global deterministic culling); upper-bound analysis",
+                           proportional_typewise = "Cross-type fairness + strong selection; avoids single-type wipeout",
+                           proportional_prob = "Smooth probabilistic retention; good for estimating P(g)/D(g)",
+                           proportional_typewise_prob = "Recommended default: cross-type fairness + smooth; robust estimation",
+                           cfg_i$supply_mode),
           replicate    = as.integer(job$global_id),
           global_id    = as.integer(job$global_id),
           out_dir      = job$out_dir,
