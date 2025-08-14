@@ -233,7 +233,7 @@ if ("need_over_g" %in% names(events_df)) {
       labs(x = "g", y = "net growth rate per hour", color = "",
            title = "Net growth = P(g) - D(g) (GAM)") +
       theme_bw()
-    ggsave(paste0(out_prefix, "_net_PD.png"), p_net, width = 6, height = 4, dpi = 150)
+    ggsave(paste0(out_prefix, "_net_PD.pdf"), p_net, width = 6, height = 4)
   }
 
   list(bins = bins_all, gam = gam_models, curves = pred_grid)
@@ -429,14 +429,14 @@ summarize_PD_all <- function(results_root,
       geom_line(aes(y = D_hat), linetype = 2) +
       labs(x = "g", y = "rate per hour", color = "supply", title = "Tumor: P(g) (solid) & D(g) (dashed) — binned") +
       theme_bw()
-    ggsave(out_png("ALL_bins_tumor_lines.png"), p_bins_t, width = 7, height = 5, dpi = 150)
+    ggsave(out_png("ALL_bins_tumor_lines.pdf"), p_bins_t, width = 7, height = 5)
 
     p_bins_n <- ggplot(bins_n, aes(x = g_mid, color = supply, group = supply)) +
       geom_line(aes(y = P_hat)) +
       geom_line(aes(y = D_hat), linetype = 2) +
       labs(x = "g", y = "rate per hour", color = "supply", title = "Normal: P(g) (solid) & D(g) (dashed) — binned") +
       theme_bw()
-    ggsave(out_png("ALL_bins_normal_lines.png"), p_bins_n, width = 7, height = 5, dpi = 150)
+    ggsave(out_png("ALL_bins_normal_lines.pdf"), p_bins_n, width = 7, height = 5)
   }
 
   # 3.2 Overlay GAM curves (Tumor / Normal)
@@ -447,7 +447,7 @@ summarize_PD_all <- function(results_root,
       labs(x = "g", y = "rate per hour", color = "supply",
            title = "Tumor: P(g) (solid) & D(g) (dashed) — GAM") +
       theme_bw()
-    ggsave(out_png("ALL_curves_tumor_overlay.png"), p_curv_t, width = 7, height = 5, dpi = 150)
+    ggsave(out_png("ALL_curves_tumor_overlay.pdf"), p_curv_t, width = 7, height = 5)
 
     p_curv_n <- ggplot(curves_all, aes(x = g, color = supply)) +
       geom_line(aes(y = P_normal)) +
@@ -455,7 +455,7 @@ summarize_PD_all <- function(results_root,
       labs(x = "g", y = "rate per hour", color = "supply",
            title = "Normal: P(g) (solid) & D(g) (dashed) — GAM") +
       theme_bw()
-    ggsave(out_png("ALL_curves_normal_overlay.png"), p_curv_n, width = 7, height = 5, dpi = 150)
+    ggsave(out_png("ALL_curves_normal_overlay.pdf"), p_curv_n, width = 7, height = 5)
 
     # 3.3 Net growth (P-D) overlay (Tumor / Normal)
     net_tbl <- curves_all %>%
@@ -469,11 +469,11 @@ summarize_PD_all <- function(results_root,
       labs(x = "g", y = "net rate per hour", color = "supply",
            title = "Net growth = P(g) - D(g) (Tumor solid / Normal dashed)") +
       theme_bw()
-    ggsave(out_png("ALL_curves_net_PD_overlay.png"), p_net, width = 7, height = 5, dpi = 150)
+    ggsave(out_png("ALL_curves_net_PD_overlay.pdf"), p_net, width = 7, height = 5)
   }
 
   message("Done. Outputs are in: ", results_root,
           "\n - ALL_bins.csv / ALL_bins_w_manifest.csv",
           "\n - ALL_curves_raw.csv / ALL_curves_interp.csv / ALL_curves_interp_w_manifest.csv",
-          "\n - ALL_*_overlay.png / ALL_*_lines.png")
+          "\n - ALL_*_overlay.pdf / ALL_*_lines.pdf")
 }
