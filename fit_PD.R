@@ -204,7 +204,7 @@ if ("need_over_g" %in% names(events_df)) {
       if (!is.null(pred_grid)) pred_grid %>% select(g, P_tumor, D_tumor) else NULL,
       "P_tumor", "D_tumor"
     )
-    ggsave(paste0(out_prefix, "_tumor_PD.png"), p_tum, width = 6, height = 4, dpi = 150)
+    ggsave(paste0(out_prefix, "_tumor_PD.pdf"), p_tum, width = 6, height = 4)
   }
   if (nrow(bins_normal) > 0) {
     p_nor <- plot_one(
@@ -213,7 +213,7 @@ if ("need_over_g" %in% names(events_df)) {
       if (!is.null(pred_grid)) pred_grid %>% select(g, P_normal, D_normal) else NULL,
       "P_normal", "D_normal"
     )
-    ggsave(paste0(out_prefix, "_normal_PD.png"), p_nor, width = 6, height = 4, dpi = 150)
+    ggsave(paste0(out_prefix, "_normal_PD.pdf"), p_nor, width = 6, height = 4)
   }
 
   # (Optional) Net fitness comparison plot using GAM curves (if fd & rt provided)
