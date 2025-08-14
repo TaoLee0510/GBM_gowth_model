@@ -42,3 +42,15 @@ run_diversity_timeseries(
   do_per_sim  = TRUE
 )
 
+
+# ---- Decomposition examples: Path A and Path B ----
+# ev_one <- read_events_dir(file.path(base_output, "Results", "0.25", "Sim_001", "events"))
+# Path A: baseline calibration (group by karyotype if available, else Label)
+# PD_decompose_pathA(ev_one,
+#   out_prefix = file.path(base_output, "Results", "0.25", "Sim_001", "PD_decomp_pathA"),
+#   bins = 30, group_field = NULL, suff_threshold = 1.0,
+#   exclude_daily = TRUE, death_mode = "resource_only")
+# Path B: GAM-based decomposition
+# PD_decompose_pathB_gam(ev_one,
+#   out_prefix = file.path(base_output, "Results", "0.25", "Sim_001", "PD_decomp_pathB"),
+#   group_field = NULL, k = 10, exclude_daily = TRUE, death_mode = "resource_only")

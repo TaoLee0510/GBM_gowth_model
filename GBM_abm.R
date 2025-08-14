@@ -229,6 +229,30 @@ run_simulation_cfg <- function(cfg, karyolib, outputdir, prefix = "Cells", globa
 
   max_steps <- as.integer(cfg$Time)
   if (is.na(max_steps) || max_steps < 1L) max_steps <- 240L
+
+  # Helper: compute per-cell crowding (number of living neighbors within a disk radius)
+  .compute_crowding <- function(grid_mat, radius) {
+    alive <- !is.na(grid_mat)
+    nr <- nrow(alive); nc <- ncol(alive)
+    acc <- matrix(0L, nrow = nr, ncol = nc)
+    r <- as.integer(radius)
+    for (dx in -r:r) {
+     for (dy in -r:r) {
+        if (dx == 0L && dy == 0L) next
+        if ((dx*dx + dy*dy) > r*r) next  # use disk mask
+        # source slice (shifted by +dx,+dy)
+        rs <- max(1L, 1L + dx):min(nr, nr + dx)
+        cs <- max(1L, 1L + dy):min(nc, nc + dy)
+        # destination slice
+        rd <- max(1L, 1L - dx):min(nr, nr - dx)
+        cd <- max(1L, 1L - dy):min(nc, nc - dy)
+        acc[rd, cd] <- acc[rd, cd] + alive[rs, cs]
+      }
+    }
+    acc
+  }
+
+
   while (step < max_steps) {
     step <- step + 1L
 
@@ -296,14 +320,21 @@ run_simulation_cfg <- function(cfg, karyolib, outputdir, prefix = "Cells", globa
 
     id_state$max_id <- res$max_id
 
-    # Push per-hour events to buffer
+    # Build per-row karyotype string from K1..K22
+    k_cols <- paste0("K", 1:22)
+    kt_strs <- do.call(paste, c(as.data.frame(Cells[, k_cols, drop = FALSE]), list(sep = ".")))
+    # Compute crowding (neighbors within radius) for each cell at this hour
+    crowd_mat <- .compute_crowding(grid, cfg$radius)
+    crowd_vec <- crowd_mat[cbind(Cells$X, Cells$Y)]
     events_buffer[[length(events_buffer) + 1L]] <- tibble::tibble(
       step = step,
       id   = Cells$id,
       Label = Cells$Label,
+      kt = kt_strs,
       g_alloc = Cells$g_alloc,
       need = Cells$need,
       need_over_g = Cells$need_over_g,
+      crowding = as.integer(crowd_vec),
       div_event = Cells$div_event,
       death_event = Cells$death_event,
       risk_div = Cells$risk_div,
