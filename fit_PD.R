@@ -55,12 +55,20 @@ fit_PD_from_events <- function(events_df,
     filter(is.finite(g), g >= 0)
 
       # Prefer pressure metric if available; fallback to g_alloc
-  g_label <- "g (per-hour glucose allocation)"
-  if ("need_over_g" %in% names(events_df)) {
-    df$g <- as.numeric(events_df$need_over_g)
-    df <- df %>% filter(is.finite(g), g >= 0)
-    g_label <- "need/g (pressure)"
+  # Prefer pressure metric if available; fallback to g_alloc
+g_label <- "g (per-hour glucose allocation)"
+if ("need_over_g" %in% names(events_df)) {
+  df$g <- as.numeric(events_df$need_over_g)
+  # when g_alloc==0, need_over_g is Inf（resource death）。
+  # let Inf as the biggest walue： a little larger。
+  g_fin <- df$g[is.finite(df$g)]
+  if (any(!is.finite(df$g))) {
+    cap <- if (length(g_fin) > 0) max(g_fin, na.rm = TRUE) else 1
+    df$g[is.infinite(df$g)] <- cap * 1.05
   }
+  df <- df %>% filter(is.finite(g), g >= 0)
+  g_label <- "need/g (pressure)"
+}
 
   # For random-only death analysis we must NOT drop daily ticks
   local_exclude_daily <- if (death_mode == "random_only") FALSE else isTRUE(exclude_daily)
