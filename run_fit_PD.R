@@ -30,4 +30,15 @@ summarize_PD_all(
   overwrite_fit  = FALSE             # Set to TRUE to rerun the _ALL fit for each supply
 )
 
+# ---- Diversity time series analysis ----
+# This script orchestrates the diversity analysis and per-simulation plots.
+# ---- Diversity & Time-Series Analysis (single call) ----
+source("/Users/4482173/Documents/GitHub/GBM_gowth_model/Diversity_TimeSeries_Analysis.R")
+run_diversity_timeseries(
+  base_output = base_output,
+  top_n_karyotypes = 12,
+  sample_cells = 5000,
+  do_diversity = TRUE,
+  do_per_sim  = TRUE
+)
 
