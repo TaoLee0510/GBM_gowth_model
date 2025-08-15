@@ -1,6 +1,6 @@
-base_output <- "/Users/4482173/Documents/Project/GBM_Model"
+base_output <- "/Volumes/Protable Disk/Project/GBM/ABM"
 
-source("/Users/4482173/Library/CloudStorage/OneDrive-MoffittCancerCenter/GitHub/GBM_gowth_model/fit_PD.R")
+source("/Users/taolee/Documents/GitHub/GBM_gowth_model/fit_PD.R")
 #
 # 1) Fit all simulations under a specific supply together:
 fit_PD_from_results(file.path(base_output, "Results"),
@@ -17,7 +17,7 @@ fit_PD_from_events(ev, out_prefix = file.path(base_output, "Results", "0.1", "Si
 
 
 
-base_output <- "/Users/4482173/Documents/Project/GBM_Model"
+base_output <- "/Volumes/Protable Disk/Project/GBM/ABM"
 summarize_PD_all(
   results_root   = file.path(base_output, "Results"),
   exclude_daily  = TRUE,
@@ -33,7 +33,8 @@ summarize_PD_all(
 # ---- Diversity time series analysis ----
 # This script orchestrates the diversity analysis and per-simulation plots.
 # ---- Diversity & Time-Series Analysis (single call) ----
-source("/Users/4482173/Documents/GitHub/GBM_gowth_model/Diversity_TimeSeries_Analysis.R")
+source("/Users/taolee/Documents/GitHub/GBM_gowth_model/Diversity_TimeSeries_Analysis.R")
+base_output <- "/Volumes/Protable Disk/Project/GBM/ABM"
 run_diversity_timeseries(
   base_output = base_output,
   top_n_karyotypes = 12,

@@ -5,16 +5,25 @@ library(purrr)
 library(stringr)
 library(ggplot2)
 library(mgcv)
+library(arrow) 
 
-# Helper: read all events CSV files under a simulation's events directory
+# Helper: read all events files under a simulation's events directory (Parquet preferred, CSV as fallback)
 read_events_dir <- function(dir_events) {
-  files <- list.files(dir_events, pattern = "_events\\.csv$", full.names = TRUE)
+  if (!dir.exists(dir_events)) return(NULL)
+  # Prefer Parquet (zstd) written by the simulator
+  pq_files <- list.files(dir_events, pattern = "\\.parquet$", full.names = TRUE)
+  if (length(pq_files) > 0) {
+    ds <- arrow::open_dataset(dir_events, format = "parquet")
+    df <- ds %>% dplyr::collect()
+    return(df)
+  }
+  # Fallback: CSV or CSV.GZ from older runs
+  files <- list.files(dir_events, pattern = "_events\\.csv(\\.gz)?$", full.names = TRUE)
   if (length(files) == 0) return(NULL)
-  df <- files %>% map_dfr(\(f) readr::read_csv(f, show_col_types = FALSE) %>% mutate(.file = basename(f)))
-  # Expected columns include at least:
-  # step, id, Label, g_alloc, div_event, death_event, risk_div,
-  # death_resource, death_random, death_timeout
-  df
+  files %>% purrr::map_dfr(\(f)
+    readr::read_csv(f, show_col_types = FALSE) %>%
+      dplyr::mutate(.file = basename(f))
+  )
 }
 
 # Core fitting function: Fit P(g) and D(g) from per-hour event logs
@@ -332,14 +341,23 @@ summarize_PD_all <- function(results_root,
 
   suppressPackageStartupMessages({
     library(dplyr); library(readr); library(purrr)
-    library(stringr); library(ggplot2)
-  })
+    library(stringr); library(ggplot2); library(arrow)
+})
 
   # ---------- helpers ----------
   read_events_dir <- function(dir_events) {
-    files <- list.files(dir_events, pattern = "_events\\.csv$", full.names = TRUE)
+    if (!dir.exists(dir_events)) return(NULL)
+    pq <- list.files(dir_events, pattern = "\\.parquet$", full.names = TRUE)
+    if (length(pq) > 0) {
+      ds <- arrow::open_dataset(dir_events, format = "parquet")
+      return(ds %>% dplyr::collect())
+    }
+    files <- list.files(dir_events, pattern = "_events\\.csv(\\.gz)?$", full.names = TRUE)
     if (length(files) == 0) return(NULL)
-    files %>% map_dfr(\(f) readr::read_csv(f, show_col_types = FALSE) %>% mutate(.file = basename(f)))
+    files %>% purrr::map_dfr(\(f)
+      readr::read_csv(f, show_col_types = FALSE) %>%
+        dplyr::mutate(.file = basename(f))
+    )
   }
 
   read_supply_events <- function(supply_dir) {
@@ -495,7 +513,7 @@ summarize_PD_all <- function(results_root,
       transmute(supply, g,
                 net_tumor  = P_tumor - D_tumor,
                 net_normal = P_normal - D_normal,
-                supply_ratio = supply_ratio %||% NA_real_)
+                supply_ratio = ifelse(is.null(supply_ratio), NA_real_, supply_ratio))
     p_net <- ggplot(net_tbl, aes(x = g, color = supply)) +
       geom_line(aes(y = net_tumor)) +
       geom_line(aes(y = net_normal), linetype = 2) +

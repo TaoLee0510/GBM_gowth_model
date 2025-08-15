@@ -13,6 +13,7 @@ library(tibble)
 library(stringr)
 library(Rcpp)
 library(future.apply)
+library(arrow)   # ← NEW: for Parquet I/O
 
 
 # Avoid serializing external pointers and reloading on workers
@@ -379,8 +380,8 @@ run_simulation_cfg <- function(cfg, karyolib, outputdir, prefix = "Cells", globa
         ev_dir <- file.path(outputdir, "events")
         dir.create(ev_dir, showWarnings = FALSE, recursive = TRUE)
         ev_tbl <- dplyr::bind_rows(events_buffer)
-        ev_path <- sprintf(paste0(ev_dir, "/%s_day%03d_events.csv"), prefix, day_index)
-        write.csv(ev_tbl, ev_path, row.names = FALSE)
+        ev_path <- sprintf(paste0(ev_dir, "/%s_day%03d_events.parquet"), prefix, day_index)
+        arrow::write_parquet(ev_tbl, ev_path, compression = "zstd", compression_level = 3)
         events_buffer <- list()
       }
 
@@ -513,7 +514,7 @@ run_ABM_simulation <- function(cfg_file, karyolib_file, base_output, workers = m
       invisible(TRUE)
     },
     future.globals = FALSE,
-    future.packages = c("Rcpp","yaml","dplyr","tibble","future.apply"),
+    future.packages = c("Rcpp","yaml","dplyr","tibble","future.apply","arrow"),
     future.seed = TRUE
   )
 }

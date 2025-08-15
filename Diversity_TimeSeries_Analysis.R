@@ -73,17 +73,29 @@ collect_diversity_across_results <- function(results_root) {
 # ---- (1b) Boxplot + mean line (faceted by supply) ----
 plot_diversity_boxplots <- function(div_all, out_path = NULL) {
   if (nrow(div_all) == 0) return(invisible(NULL))
-  long <- div_all %>%
-    pivot_longer(cols = c(H, Simpson, Entropy), names_to = "metric", values_to = "value")
+  # Only keep Entropy and bin by 30 days
+long <- div_all %>%
+  select(day, supply, Entropy) %>%
+  mutate(
+    day_bin = floor(day / 30),
+    day_bin_label = paste0(day_bin * 30, "-", day_bin * 30 + 29)
+  ) %>%
+  rename(value = Entropy) %>%
+  mutate(
+    # Ensure chronological order of bins on x-axis within each supply panel
+    day_bin_label = factor(day_bin_label,
+                           levels = unique(day_bin_label[order(day_bin)]))
+  )
 
-  p <- ggplot(long, aes(x = day, y = value, group = factor(day))) +
-    geom_boxplot(outlier_size = 0.7, width = 0.6, alpha = 0.85) +
-    stat_summary(fun = mean, geom = "line", aes(group = 1), linewidth = 1) +
-    facet_grid(metric ~ supply, scales = "free_y") +
-    labs(x = "Day", y = "Value", title = "Diversity over time across replicates") +
-    theme_bw()
-  if (!is.null(out_path)) ggsave(out_path, p, width = 12, height = 8)
-  p
+p <- ggplot(long, aes(x = day_bin_label, y = value, group = day_bin_label)) +
+  geom_boxplot(outlier_size = 0.7, width = 0.6, alpha = 0.85) +
+  stat_summary(fun = mean, geom = "line", aes(group = 1), linewidth = 1) +
+  facet_grid(. ~ supply, scales = "free_y") +
+  labs(x = "Day bin (30 days)", y = "Entropy (Shannon)",
+       title = "Entropy over time across replicates (30-day bins)") +
+  theme_bw()
+if (!is.null(out_path)) ggsave(out_path, p, width = 12, height = 8, device = cairo_pdf)
+p
 }
 
 #
@@ -103,10 +115,22 @@ plot_G_violin_for_sim <- function(csv_dir, out_path, sample_cells = 5000) {
   })
   if (nrow(g_tbl) == 0) return(invisible(NULL))
 
-  p <- ggplot(g_tbl, aes(x = factor(day), y = G, group = factor(day))) +
+  # --- NEW: aggregate into 30-day bins ---
+  g_tbl <- g_tbl %>%
+    mutate(
+      day_bin = floor(day / 30),
+      day_bin_label = paste0(day_bin * 30, "-", day_bin * 30 + 29)
+    ) %>%
+    mutate(
+      # sort by time
+      day_bin_label = factor(day_bin_label, levels = unique(day_bin_label))
+    )
+
+  p <- ggplot(g_tbl, aes(x = day_bin_label, y = G, group = day_bin_label)) +
     geom_violin(scale = "width", trim = FALSE) +
     stat_summary(fun = median, geom = "point", size = 1.2) +
-    labs(x = "Day", y = "G", title = "Distribution of G over time (per simulation)") +
+    labs(x = "Day bin (30 days)", y = "G",
+         title = "Distribution of G over time (30-day bins, per simulation)") +
     theme_bw()
   ggsave(out_path, p, width = 10, height = 5)
   p
@@ -122,7 +146,9 @@ compute_karyotype_proportions <- function(csv_dir, top_n = 12) {
   by_day <- purrr::map_dfr(files, function(f) {
     day <- .parse_day(f)
     df  <- readr::read_csv(f, show_col_types = FALSE, progress = FALSE, col_types = cols())
-    if (!all(.kt_cols() %in% names(df))) return(tibble())
+    if (!all(c(.kt_cols(), "Label") %in% names(df))) return(tibble())
+    df <- df %>% filter(Label == 1L)  # tumor only
+    if (nrow(df) == 0) return(tibble())
     kt  <- .kt_str(df[, .kt_cols(), drop = FALSE])
     tibble(day = day, kt = kt)
   })
@@ -146,7 +172,7 @@ plot_karyotype_stream_for_sim <- function(csv_dir, out_path, top_n = 12) {
     geom_area(position = "fill", alpha = 0.95) +
     scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
     labs(x = "Day", y = "Proportion", fill = "Karyotype",
-         title = sprintf("Karyotype composition over time (Top-%d)", length(unique(prop_tbl$kt2)))) +
+        title = sprintf("Tumor-only karyotype composition over time (Top-%d)", length(unique(prop_tbl$kt2)))) +
     theme_bw()
   ggsave(out_path, p, width = 10, height = 6)
   p
@@ -158,8 +184,8 @@ plot_karyotype_stream_for_sim <- function(csv_dir, out_path, top_n = 12) {
 run_diversity_analysis_all <- function(base_output) {
   results_root <- file.path(base_output, "Results")
   div_all <- collect_diversity_across_results(results_root)
-  out_png <- file.path(results_root, "diversity_boxplots_by_supply.png")
-  plot_diversity_boxplots(div_all, out_png)
+  out_pdf <- file.path(results_root, "diversity_boxplots_by_supply.pdf")
+  plot_diversity_boxplots(div_all, out_pdf)
   invisible(div_all)
 }
 
