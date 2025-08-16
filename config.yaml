@@ -20,7 +20,7 @@ Cg: 1.0                        # Normal cell Glu absorbing
 m: 0.60                        # Normal cell density
 N_death_rate: 0.004            # Normal cell death rate(every 24 hours) 
 T_death_rate: 0.002            # Normal cell death rate(every 24 hours) 
-MSR: 1.1                       # MSR 0.025 * 44
+MSR: "0.22,1.1,5.5"                       # MSR 0.025 * 44
 Mnr: 0.0005                       # Migration normal cells rate
 Mtr: 0.0025                       # Migration tumor cells rate  
 radius: 2                      # radius
