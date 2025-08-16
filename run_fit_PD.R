@@ -1,6 +1,6 @@
-base_output <- "/Users/4482173/Documents/Project/GBM_Model"
+base_output <- "/Volumes/Protable Disk/Project/GBM/ABM"
 
-source("/Users/4482173/Library/CloudStorage/OneDrive-MoffittCancerCenter/GitHub/GBM_gowth_model/fit_PD.R")
+source("/Users/4482173/Documents/GitHub/GBM_gowth_model/fit_PD.R")
 #
 # 1) Fit all simulations under a specific supply together:
 fit_PD_from_results(file.path(base_output, "Results"),
@@ -17,7 +17,7 @@ fit_PD_from_events(ev, out_prefix = file.path(base_output, "Results", "0.1", "Si
 
 
 
-base_output <- "/Users/4482173/Documents/Project/GBM_Model"
+base_output <- "/Volumes/Protable Disk/Project/GBM/ABM"
 summarize_PD_all(
   results_root   = file.path(base_output, "Results"),
   exclude_daily  = TRUE,
@@ -30,4 +30,27 @@ summarize_PD_all(
   overwrite_fit  = FALSE             # Set to TRUE to rerun the _ALL fit for each supply
 )
 
+# ---- Diversity time series analysis ----
+# This script orchestrates the diversity analysis and per-simulation plots.
+# ---- Diversity & Time-Series Analysis (single call) ----
+source("/Users/4482173/Documents/GitHub/GBM_gowth_model/Diversity_TimeSeries_Analysis.R")
+base_output <- "/Volumes/Protable Disk/Project/GBM/ABM"
+run_diversity_timeseries(
+  base_output = base_output,
+  sample_cells = Inf,
+  do_diversity = FALSE,
+  do_per_sim  = TRUE
+)
 
+
+# ---- Decomposition examples: Path A and Path B ----
+# ev_one <- read_events_dir(file.path(base_output, "Results", "0.25", "Sim_001", "events"))
+# Path A: baseline calibration (group by karyotype if available, else Label)
+# PD_decompose_pathA(ev_one,
+#   out_prefix = file.path(base_output, "Results", "0.25", "Sim_001", "PD_decomp_pathA"),
+#   bins = 30, group_field = NULL, suff_threshold = 1.0,
+#   exclude_daily = TRUE, death_mode = "resource_only")
+# Path B: GAM-based decomposition
+# PD_decompose_pathB_gam(ev_one,
+#   out_prefix = file.path(base_output, "Results", "0.25", "Sim_001", "PD_decomp_pathB"),
+#   group_field = NULL, k = 10, exclude_daily = TRUE, death_mode = "resource_only")

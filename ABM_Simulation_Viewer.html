@@ -1,0 +1,636 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>ABM Simulation Viewer</title>
+<style>
+  :root { --gap: 14px; --bg: #0b0d11; --fg: #e9eef2; --muted:#9aa7b2; }
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial;}
+  .wrap{max-width:1400px;margin:0 auto;padding:16px;}
+  h1{font-size:18px;margin:0 0 8px 0}
+  .bar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+  select, input[type="range"]{background:#121721;color:var(--fg);border:1px solid #1e2632;border-radius:6px;padding:6px 10px}
+  .grid{display:grid;grid-template-columns:1fr;gap:var(--gap)}
+  .row-3{display:grid;grid-template-columns:1fr 1fr;gap:var(--gap)}
+  .row-2{display:grid;grid-template-columns:1fr 1fr;gap:var(--gap)}
+  .card{background:#0f141c;border:1px solid #1a2330;border-radius:10px;padding:10px;position:relative}
+  .shot{position:relative; background:#0b0f15; border-radius:8px; overflow:hidden; min-height:180px; padding:0}
+  .shot img{display:block;width:100%;height:auto}
+  .shot.is-pdf{ aspect-ratio: var(--pdf-aspect, 1.6667); }
+  .shot iframe, .shot embed { width:100%; height:100%; display:block; }
+  .ovl{position:absolute; inset:0; pointer-events:none; z-index:10}
+  .legend{color:var(--muted);font-size:12px;margin-top:6px}
+  .slab{display:flex;gap:12px;align-items:center;margin-top:6px}
+  .pill{background:#162233;color:#b9c7d6;border:1px solid #233349;border-radius:999px;padding:4px 10px;font-size:12px}
+  .note{color:#94a3b8;font-size:12px}
+  .err{color:#ff9aa2}
+  .row-title{margin:2px 0 8px 4px;color:#c7d2e0;font-weight:600}
+  .dim{color:#8aa0b4}
+  .code{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;background:#0c1118;border:1px solid #1b2533;border-radius:6px;padding:2px 6px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>ABM Simulation Viewer</h1>
+
+  <div class="bar">
+    <label>Supply:</label>
+    <select id="supplySel"></select>
+    <label>Simulation:</label>
+    <select id="simSel"></select>
+    <span id="status" class="note"></span>
+  </div>
+
+  <div class="grid">
+    <div class="row-2">
+      <div class="card">
+        <div class="row-title">Karyotype counts (union ≥99%)</div>
+        <div class="legend"><a id="openFunnel" href="#" target="_blank" class="note">Open original</a></div>
+        <div class="shot" id="shotFunnel">
+          <img id="imgFunnel" alt="Karyotype_counts_funnel_union99" />
+          <embed id="embFunnel" type="application/pdf" style="display:none;width:100%;height:100%;border:0;" />
+          <canvas class="ovl" id="ovlFunnel"></canvas>
+        </div>
+        <div class="legend">A vertical guide updates with the time slider</div>
+      </div>
+
+      <div class="card">
+        <div class="row-title">Karyotype stream (union ≥99%)</div>
+        <div class="legend"><a id="openStream" href="#" target="_blank" class="note">Open original</a></div>
+        <div class="shot" id="shotStream">
+          <img id="imgStream" alt="Karyotype_stream_union99" />
+          <embed id="embStream" type="application/pdf" style="display:none;width:100%;height:100%;border:0;" />
+          <canvas class="ovl" id="ovlStream"></canvas>
+        </div>
+        <div class="legend">A vertical guide updates with the time slider</div>
+      </div>
+    </div>
+
+    <div class="row-3">
+      <div class="card">
+        <div class="row-title">Cells (png)</div>
+        <div class="shot">
+          <img id="imgCells" alt="Cells_dayXXX.png" />
+        </div>
+        <div class="slab">
+          <span class="pill">png</span>
+          <span class="note">Day image</span>
+        </div>
+      </div>
+      <div class="card">
+        <div class="row-title">Cells by karyotype (png_karyo)</div>
+        <div class="shot">
+          <img id="imgKaryo" alt="Cells_karyo_dayXXX.png" />
+        </div>
+        <div class="slab">
+          <span class="pill">png_karyo</span>
+          <span class="note">Karyotype-colored day image</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="row-title">Time</div>
+      <div class="slab">
+      <button id="btnPlay" class="pill" type="button" title="Play/Pause">▶ Play</button>
+      <label class="note" for="selSpeed">Speed:</label>
+      <select id="selSpeed">
+        <option value="0.5">0.5×</option>
+        <option value="1" selected>1×</option>
+        <option value="2">2×</option>
+        <option value="5">5×</option>
+        <option value="10">10×</option>
+      </select>
+
+      <input type="range" id="daySlider" min="0" max="1" value="0" step="1" style="flex:1" />
+      <span>Day: <span id="dayVal">1</span></span>
+      <span class="dim">/ max <span id="dayMax">?</span></span>
+    </div>
+    </div>
+  </div>
+</div>
+
+<script>
+/** ======= CONFIG ======= **/
+// Place this HTML next to the Results/ root; otherwise update BASE_PATH:
+const BASE_PATH = "./Results.old";
+
+// Supply list (adjust to your config.yaml if needed)
+// PDF aspect ratios (width/height). Adjust if your PDFs use a different size.
+const PDF_ASPECT_COUNTS = 5/3;   // e.g., 10in x 6in -> 1.6667
+const PDF_ASPECT_STREAM = 5/3;   // keep same if both exported identically
+const SUPPLIES = ["0.1","0.25","0.5","1","1.5","2"];
+
+// Anchors defined on a reference timeline (keep proportions for any actual maxDay)
+const GUIDE_REF_TOTAL = 720;   // reference total days
+const GUIDE_REF_LEFT  = 88;    // left anchor on the reference timeline
+const GUIDE_REF_RIGHT = 670;   // right anchor on the reference timeline
+
+// Derived fractional anchors (proportions), independent of actual maxDay
+function getGuideFracs(maxDay){
+  const startFrac = GUIDE_REF_LEFT  / Math.max(1, GUIDE_REF_TOTAL);
+  const endFrac   = GUIDE_REF_RIGHT / Math.max(1, GUIDE_REF_TOTAL);
+  return {
+    startFrac: Math.max(0, Math.min(1, startFrac)),
+    endFrac:   Math.max(0, Math.min(1, endFrac)),
+  };
+}
+// Optional pixel paddings to align guide with PDF plot area (tune as needed)
+const GUIDE_PAD_LEFT  = 0;  // left margin inside the PDF image area
+const GUIDE_PAD_RIGHT = 0;  // right margin inside the PDF image area
+
+// Candidate summary figure filenames (tried in order)
+const CANDIDATE_FUNNEL = [
+  "analysis/Karyotype_counts_funnel_union99.pdf",
+  "analysis/Karyotype_counts_funnel_union99.png",
+  "analysis/Karyotype_counts_funnel_union99.jpg",
+  "analysis/Karyotype_counts_funnel_union99.jpeg",
+  "analysis/Karyotype_counts_funnel_union99.pdf.png",
+  // legacy fallbacks
+  "Karyotype_counts_funnel_union99.pdf",
+  "Karyotype_counts_funnel_union99.png",
+  "png/Karyotype_counts_funnel_union99.png",
+  "png_karyo/Karyotype_counts_funnel_union99.png"
+];
+const CANDIDATE_STREAM = [
+  "analysis/Karyotype_stream_union99.pdf",
+  "analysis/Karyotype_stream_union99.png",
+  "analysis/Karyotype_stream_union99.jpg",
+  "analysis/Karyotype_stream_union99.jpeg",
+  "analysis/Karyotype_stream_union99.pdf.png",
+  // legacy fallbacks
+  "Karyotype_stream_union99.pdf",
+  "Karyotype_stream_union99.png",
+  "png/Karyotype_stream_union99.png",
+  "png_karyo/Karyotype_stream_union99.png"
+];
+
+// Fixed naming pattern for day images (row 3)
+const CELLS_PATH   = (supply, sim, day) => {
+  const m = sim.match(/Sim_(\d{3})$/);
+  const rep = m ? m[1] : "001";
+  const sup = encodeURIComponent(supply);
+  return `${BASE_PATH}/${sup}/${sim}/png/Cells_supply_${supply}_rep${rep}_day${day}.png`;
+};
+const KARYO_PATH   = (supply, sim, day) => `${BASE_PATH}/${encodeURIComponent(supply)}/${sim}/png_karyo/Cells_karyo_day${day}.png`;
+
+// Utilities
+const $ = sel => document.querySelector(sel);
+
+function setStatus(msg, isErr=false){
+  const s = $("#status");
+  s.textContent = msg || "";
+  s.className = isErr ? "note err" : "note";
+}
+
+function checkImg(url, timeout=5000){
+  return new Promise(res=>{
+    const img = new Image();
+    let done=false;
+    const t = setTimeout(()=>{ if(!done){done=true; img.src=""; res(false);} }, timeout);
+    img.onload = ()=>{ if(!done){done=true; clearTimeout(t); res(true);} };
+    img.onerror= ()=>{ if(!done){done=true; clearTimeout(t); res(false);} };
+    img.src = url;
+  });
+}
+
+// Format 1 -> "001"
+function pad3(n){ n = parseInt(n,10)||0; return String(n).padStart(3,"0"); }
+
+// Detect available Sim_* (1..50); if day001.png exists, mark as available
+async function detectSims(supply){
+  const sims = [];
+  console.log("[detectSims] supply=", supply, "BASE_PATH=", BASE_PATH);
+  for(let i=1; i<=50; i++){
+    const sim = `Sim_${String(i).padStart(3,"0")}`;
+    const testUrl = CELLS_PATH(supply, sim, "001");
+    /* eslint no-await-in-loop: 0 */
+    const ok = await checkImg(testUrl, 1500);
+    if(ok) sims.push(sim);
+  }
+  return sims;
+}
+
+// For a given sim, detect max day (exponential search + binary search)
+async function detectMaxDay(supply, sim){
+  // 指数增长直到失败
+  let lo = 1, hi = 1;
+  while(true){
+    const ok = await checkImg(CELLS_PATH(supply, sim, pad3(hi)), 1200);
+    if(!ok) break;
+    lo = hi;
+    hi *= 2;
+    if(hi > 4096) break;
+  }
+  // 二分查找最后成功
+  let L = lo, R = hi - 1;
+  while(L < R){
+    const mid = Math.ceil((L+R+1)/2);
+    /* eslint no-await-in-loop: 0 */
+    const ok = await checkImg(CELLS_PATH(supply, sim, pad3(mid)), 800);
+    if(ok) L = mid; else R = mid - 1;
+  }
+  return Math.max(1, L);
+}
+
+// Pick the first existing path from candidates
+async function resolveOne(supply, sim, candidates){
+  for (const rel of candidates) {
+    const base = `${BASE_PATH}/${encodeURIComponent(supply)}/${sim}/`;
+    const url  = `${base}${rel}`;
+    const isPdf = /\.pdf$/i.test(rel);
+
+    if (isPdf) {
+      // Prefer an image fallback if present
+      const png1 = rel.replace(/\.pdf$/i, ".pdf.png");
+      const png2 = rel.replace(/\.pdf$/i, ".png");
+      const jpg1 = rel.replace(/\.pdf$/i, ".jpg");
+      const jpg2 = rel.replace(/\.pdf$/i, ".jpeg");
+
+      const candImgs = [png1, png2, jpg1, jpg2]
+        .filter((x) => x && !/\.pdf$/i.test(x));
+
+      for (const imgRel of candImgs) {
+        /* eslint no-await-in-loop: 0 */
+        const ok = await checkImg(`${base}${imgRel}`, 1200);
+        if (ok) {
+          console.log('[resolveOne] using image fallback for PDF:', `${base}${imgRel}`);
+          return `${base}${imgRel}`;
+        }
+      }
+      console.log('[resolveOne] using PDF (no image fallback found):', url);
+      return url; // fall back to the PDF itself
+    }
+
+    /* eslint no-await-in-loop: 0 */
+    const ok  = await checkImg(url, 1200);
+    if (ok) return url;
+  }
+  return null;
+}
+
+// Draw vertical guide on overlay (map [0..maxDay] to container width)
+function drawGuide(canvas, day, maxDay){
+  const ctx = canvas.getContext("2d");
+  const host = canvas.parentElement; // shot container
+  const w = host.clientWidth || canvas.clientWidth;
+  const h = host.clientHeight || canvas.clientHeight || 400; // fallback height for PDF embeds
+  canvas.width = w; canvas.height = h;
+  ctx.clearRect(0,0,w,h);
+  // --- Begin calibration mapping for guide ---
+  // Map slider domain [0, maxDay] -> segment [startX, endX] in container pixels
+  // Map slider domain [0, maxDay] -> segment [startX, endX] in container pixels,
+  // with endpoints derived from reference fractions (proportions)
+  if (!Number.isFinite(maxDay) || maxDay <= 0) return;
+  const { startFrac, endFrac } = getGuideFracs(maxDay);
+  const startX = Math.max(0, Math.min(w-1, startFrac * (w - 1)));
+  const endX   = Math.max(0, Math.min(w-1, endFrac   * (w - 1)));
+  const seg    = Math.max(1, endX - startX);
+  let t = day / maxDay;            // 0 -> startX, maxDay -> endX
+  if (!Number.isFinite(t)) t = 0;
+  t = Math.max(0, Math.min(1, t));
+  const x = startX + t * seg;
+  // --- End calibration mapping ---
+  // debug ticks for segment endpoints
+  if (w > 20) {
+  const { startFrac, endFrac } = getGuideFracs(maxDay);
+  const sx = Math.max(0, Math.min(w-2, startFrac * (w - 1)));
+  const ex = Math.max(0, Math.min(w-2, endFrac   * (w - 1)));
+  ctx.fillStyle = "rgba(255,255,255,0.6)";
+  ctx.fillRect(sx, 0, 2, 8);  // segment start marker
+  ctx.fillRect(ex, 0, 2, 8);  // segment end marker
+}
+  ctx.strokeStyle = "rgba(0,0,0,0.9)"; // guide line in black
+  ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
+  // Top time label
+  ctx.fillStyle = "rgba(0,0,0,0.55)";
+  const tag = `Day ${day}`;
+  const tw = ctx.measureText(tag).width + 10, th = 18;
+  const tx = Math.min(Math.max(2, x - tw/2), w - tw - 2), ty = 2;
+  ctx.fillRect(tx, ty, tw, th);
+  ctx.fillStyle = "#fff";
+  ctx.font = "12px -apple-system, BlinkMacSystemFont, Segoe UI, Roboto";
+  ctx.fillText(tag, tx+5, ty+13);
+}
+
+// Redraw guide on resize
+function attachRedrawOnResize(imgEl, canvasEl, getDayMax){
+  function syncSize(){
+    // 让 canvas 尺寸跟随容器（已通过 CSS 覆盖层占满）
+    drawGuide(canvasEl, getDayMax().day, getDayMax().maxDay);
+  }
+  imgEl.addEventListener("load", syncSize);
+  window.addEventListener("resize", syncSize);
+}
+
+/** ======= UI wiring ======= **/
+const supplySel = $("#supplySel");
+const simSel    = $("#simSel");
+const daySlider = $("#daySlider");
+const dayVal    = $("#dayVal");
+const dayMaxEl  = $("#dayMax");
+const btnPlay   = document.getElementById('btnPlay');
+const selSpeed  = document.getElementById('selSpeed');
+
+const imgFunnel = $("#imgFunnel");
+const imgStream = $("#imgStream");
+const ovlFunnel = $("#ovlFunnel");
+const ovlStream = $("#ovlStream");
+const imgCells  = $("#imgCells");
+const imgKaryo  = $("#imgKaryo");
+
+const embFunnel = document.getElementById("embFunnel");
+const embStream = document.getElementById("embStream");
+
+const openFunnel = document.getElementById('openFunnel');
+const openStream = document.getElementById('openStream');
+
+// ===== Playback state =====
+const BASE_FPS = 10; // default 10 fps
+let playTimer = null;
+let isPlaying = false;
+
+function getSpeedMultiplier(){
+  const v = parseFloat(selSpeed?.value || '1');
+  return Number.isFinite(v) && v > 0 ? v : 1;
+}
+
+function nextIntervalMs(){
+  const effFps = BASE_FPS * getSpeedMultiplier();
+  return Math.max(10, Math.round(1000 / effFps));
+}
+
+function setDayVal(d){
+  const clamped = Math.max(0, Math.min(current.maxDay, d|0));
+  current.day = clamped;
+  daySlider.value = String(clamped);
+  updateDayImages();
+}
+
+function startPlayback(){
+  if (isPlaying) return;
+  isPlaying = true;
+  if (btnPlay) btnPlay.textContent = '⏸ Pause';
+  const tick = ()=> {
+    if (!isPlaying) return;
+    let next = current.day + 1;
+    if (next > current.maxDay) next = 0; // auto loop to start
+    setDayVal(next);
+    playTimer = setTimeout(tick, nextIntervalMs());
+  };
+  playTimer = setTimeout(tick, nextIntervalMs());
+}
+
+function stopPlayback(){
+  isPlaying = false;
+  if (playTimer){ clearTimeout(playTimer); playTimer = null; }
+  if (btnPlay) btnPlay.textContent = '▶ Play';
+}
+
+// --- Cache buster and media clear helpers ---
+function withCacheBuster(u){
+  if (!u) return u;
+  const ts = Date.now();
+  // Preserve any #fragment by inserting the cache key before it
+  const i = u.indexOf('#');
+  if (i >= 0){
+    const base = u.slice(0, i);
+    const frag = u.slice(i);
+    return base + (base.includes('?') ? '&' : '?') + 'v=' + ts + frag;
+  }
+  return u + (u.includes('?') ? '&' : '?') + 'v=' + ts;
+}
+
+function clearSummaryMedia(){
+  // Hide and clear sources so embeds/images are forced to reload for new supply/sim
+  imgFunnel.style.display = 'none';
+  imgFunnel.removeAttribute('src');
+  embFunnel.style.display = 'none';
+  embFunnel.removeAttribute('src');
+
+  imgStream.style.display = 'none';
+  imgStream.removeAttribute('src');
+  embStream.style.display = 'none';
+  embStream.removeAttribute('src');
+}
+
+function setSummaryMedia(which, url){
+  if (which === 'funnel' && openFunnel) openFunnel.href = withCacheBuster(url);
+  if (which === 'stream' && openStream) openStream.href = withCacheBuster(url);
+
+  const shotFunnel = document.getElementById('shotFunnel');
+  const shotStream = document.getElementById('shotStream');
+
+  const isPdf = url && url.toLowerCase().endsWith('.pdf');
+  if(which === 'funnel'){
+    if(isPdf){
+      const pdfUrlFunnel = withCacheBuster(url) + '#toolbar=0&navpanes=0&scrollbar=0&view=FitH';
+      // Force reload by clearing first
+      embFunnel.style.display = 'none';
+      embFunnel.removeAttribute('src');
+      imgFunnel.style.display = 'none';
+      imgFunnel.removeAttribute('src');
+      embFunnel.src = pdfUrlFunnel;
+      embFunnel.style.display = 'block';
+      if (shotFunnel){
+        shotFunnel.classList.add('is-pdf');
+        shotFunnel.style.setProperty('--pdf-aspect', String(PDF_ASPECT_COUNTS));
+      }
+    } else {
+      embFunnel.style.display = 'none';
+      embFunnel.removeAttribute('src');
+      imgFunnel.style.display = 'none';
+      imgFunnel.removeAttribute('src');
+      imgFunnel.src = withCacheBuster(url);
+      imgFunnel.style.display = 'block';
+      if (shotFunnel){
+        shotFunnel.classList.remove('is-pdf');
+        shotFunnel.style.removeProperty('--pdf-aspect');
+      }
+    }
+  } else if(which === 'stream'){
+    if(isPdf){
+      const pdfUrlStream = withCacheBuster(url) + '#toolbar=0&navpanes=0&scrollbar=0&view=FitH';
+      embStream.style.display = 'none';
+      embStream.removeAttribute('src');
+      imgStream.style.display = 'none';
+      imgStream.removeAttribute('src');
+      embStream.src = pdfUrlStream;
+      embStream.style.display = 'block';
+      if (shotStream){
+        shotStream.classList.add('is-pdf');
+        shotStream.style.setProperty('--pdf-aspect', String(PDF_ASPECT_STREAM));
+      }
+    } else {
+      embStream.style.display = 'none';
+      embStream.removeAttribute('src');
+      imgStream.style.display = 'none';
+      imgStream.removeAttribute('src');
+      imgStream.src = withCacheBuster(url);
+      imgStream.style.display = 'block';
+      if (shotStream){
+        shotStream.classList.remove('is-pdf');
+        shotStream.style.removeProperty('--pdf-aspect');
+      }
+    }
+  }
+  // after switching, redraw guide to fit new host size
+  drawGuide(ovlFunnel, current.day, current.maxDay);
+  drawGuide(ovlStream, current.day, current.maxDay);
+  // schedule a second pass after layout/embedding settles
+  requestAnimationFrame(()=>{
+    drawGuide(ovlFunnel, current.day, current.maxDay);
+    drawGuide(ovlStream, current.day, current.maxDay);
+  });
+}
+
+let current = { supply: SUPPLIES[0], sim: "", maxDay: 1, day: 0, funnelUrl: null, streamUrl: null };
+
+// init supplies
+function initSupplies(){
+  supplySel.innerHTML = "";
+  SUPPLIES.forEach(s=>{
+    const opt = document.createElement("option");
+    opt.value = s; opt.textContent = s;
+    supplySel.appendChild(opt);
+  });
+  supplySel.value = current.supply;
+}
+
+async function refreshSims(){
+  setStatus("Detecting simulations…");
+  simSel.innerHTML = "";
+  const sims = await detectSims(current.supply);
+  if(sims.length === 0){
+    setStatus("No simulations detected for this supply.", true);
+    return;
+  }
+  sims.forEach(s=>{
+    const opt = document.createElement("option");
+    opt.value = s; opt.textContent = s;
+    simSel.appendChild(opt);
+  });
+  current.sim = sims[0];
+  simSel.value = current.sim;
+  setStatus("");
+}
+stopPlayback();
+async function refreshMaxDayAndImages(){
+  setStatus("Scanning max day…");
+  current.maxDay = await detectMaxDay(current.supply, current.sim);
+  daySlider.max = String(current.maxDay);
+  dayMaxEl.textContent = String(current.maxDay);
+
+  // Ensure slider range and clamp current day to [0, max]
+  // Ensure slider starts from 0 for a fresh run
+  daySlider.min = "0";
+  current.day = 0;
+  daySlider.value = "0";
+  dayVal.textContent = "0";
+
+  setStatus("");
+
+  // Clear media before loading new summary charts
+  clearSummaryMedia();
+
+  // Resolve summary charts
+  setStatus("Loading summary charts…");
+  current.funnelUrl = await resolveOne(current.supply, current.sim, CANDIDATE_FUNNEL);
+  current.streamUrl = await resolveOne(current.supply, current.sim, CANDIDATE_STREAM);
+  if(current.funnelUrl) setSummaryMedia('funnel', current.funnelUrl);
+  if(current.streamUrl) setSummaryMedia('stream', current.streamUrl);
+  setStatus("");
+
+  // Initial day images
+  updateDayImages();
+  // Initial guide draw (will redraw on image load)
+  drawGuide(ovlFunnel, current.day, current.maxDay);
+  drawGuide(ovlStream, current.day, current.maxDay);
+}
+
+function updateDayImages(){
+  const imgDay = Math.max(1, current.day); // images start at day001
+  const d = pad3(imgDay);
+  imgCells.src = CELLS_PATH(current.supply, current.sim, d);
+  imgKaryo.src = KARYO_PATH(current.supply, current.sim, d);
+  dayVal.textContent = String(current.day);
+  // Update guides for the top two charts
+  drawGuide(ovlFunnel, current.day, current.maxDay);
+  drawGuide(ovlStream, current.day, current.maxDay);
+}
+
+/** Events **/
+supplySel.addEventListener("change", async e=>{
+  stopPlayback();
+  current.supply = e.target.value;
+
+  // Auto-reset timeline when switching supply
+  current.day = 0;
+  daySlider.value = "0";
+  dayVal.textContent = "0";
+
+  clearSummaryMedia();
+  await refreshSims();
+  await refreshMaxDayAndImages();
+});
+
+simSel.addEventListener("change", async e=>{
+  stopPlayback();
+  current.sim = e.target.value;
+
+  // Auto-reset timeline when switching simulation
+  current.day = 0;
+  daySlider.value = "0";
+  dayVal.textContent = "0";
+
+  clearSummaryMedia();
+  await refreshMaxDayAndImages();
+});
+
+daySlider.addEventListener("input", e=>{
+  if (isPlaying) stopPlayback(); // pause when user drags the slider
+  current.day = parseInt(e.target.value, 10) || 0;
+  updateDayImages();
+});
+
+daySlider.addEventListener("pointerdown", ()=>{
+  if (isPlaying) stopPlayback();
+});
+
+btnPlay?.addEventListener('click', ()=>{
+  if (isPlaying) stopPlayback(); else startPlayback();
+});
+
+selSpeed?.addEventListener('change', ()=>{
+  // 播放中调整倍率：重启定时器以应用新间隔
+  if (isPlaying){
+    clearTimeout(playTimer); playTimer = null;
+    const tick = ()=> {
+      if (!isPlaying) return;
+      let next = current.day + 1;
+      if (next > current.maxDay) next = 0; // auto loop to start
+      setDayVal(next);
+      playTimer = setTimeout(tick, nextIntervalMs());
+    };
+    playTimer = setTimeout(tick, nextIntervalMs());
+  }
+});
+
+// Redraw overlay when window resizes
+attachRedrawOnResize(imgFunnel, ovlFunnel, ()=>({day:current.day, maxDay:current.maxDay}));
+attachRedrawOnResize(imgStream, ovlStream, ()=>({day:current.day, maxDay:current.maxDay}));
+
+if(embFunnel) embFunnel.addEventListener('load', ()=> drawGuide(ovlFunnel, current.day, current.maxDay));
+if(embStream) embStream.addEventListener('load', ()=> drawGuide(ovlStream, current.day, current.maxDay));
+
+// boot
+(async function boot(){
+  initSupplies();
+  await refreshSims();
+  await refreshMaxDayAndImages();
+})();
+</script>
+</body>
+</html>

@@ -13,6 +13,8 @@ library(tibble)
 library(stringr)
 library(Rcpp)
 library(future.apply)
+library(arrow)   # ← NEW: for Parquet I/O
+library(ragg)   # high-quality PNG device with compression support
 
 
 # Avoid serializing external pointers and reloading on workers
@@ -220,7 +222,11 @@ run_simulation_cfg <- function(cfg, karyolib, outputdir, prefix = "Cells", globa
   # day 0 snapshot
   dir.create(file.path(outputdir, "csv"), showWarnings = FALSE, recursive = TRUE)
   dir.create(file.path(outputdir, "png"), showWarnings = FALSE, recursive = TRUE)
-  write.csv(Cells, sprintf(paste0(outputdir, "/csv/%s_day%03d.csv"), prefix, day_index), row.names = FALSE)
+  arrow::write_parquet(
+  Cells,
+  sprintf(paste0(outputdir, "/csv/%s_day%03d.parquet"), prefix, day_index),
+  compression = "zstd", compression_level = 3
+)
   cat("Day", day_index, ":", sum(Cells$Status==1L), "living cells saved\n")
 
   # Build K matrix once (will be replaced by C++ returns after each hour)
@@ -229,6 +235,30 @@ run_simulation_cfg <- function(cfg, karyolib, outputdir, prefix = "Cells", globa
 
   max_steps <- as.integer(cfg$Time)
   if (is.na(max_steps) || max_steps < 1L) max_steps <- 240L
+
+  # Helper: compute per-cell crowding (number of living neighbors within a disk radius)
+  .compute_crowding <- function(grid_mat, radius) {
+    alive <- !is.na(grid_mat)
+    nr <- nrow(alive); nc <- ncol(alive)
+    acc <- matrix(0L, nrow = nr, ncol = nc)
+    r <- as.integer(radius)
+    for (dx in -r:r) {
+     for (dy in -r:r) {
+        if (dx == 0L && dy == 0L) next
+        if ((dx*dx + dy*dy) > r*r) next  # use disk mask
+        # source slice (shifted by +dx,+dy)
+        rs <- max(1L, 1L + dx):min(nr, nr + dx)
+        cs <- max(1L, 1L + dy):min(nc, nc + dy)
+        # destination slice
+        rd <- max(1L, 1L - dx):min(nr, nr - dx)
+        cd <- max(1L, 1L - dy):min(nc, nc - dy)
+        acc[rd, cd] <- acc[rd, cd] + alive[rs, cs]
+      }
+    }
+    acc
+  }
+
+
   while (step < max_steps) {
     step <- step + 1L
 
@@ -296,14 +326,21 @@ run_simulation_cfg <- function(cfg, karyolib, outputdir, prefix = "Cells", globa
 
     id_state$max_id <- res$max_id
 
-    # Push per-hour events to buffer
+    # Build per-row karyotype string from K1..K22
+    k_cols <- paste0("K", 1:22)
+    kt_strs <- do.call(paste, c(as.data.frame(Cells[, k_cols, drop = FALSE]), list(sep = ".")))
+    # Compute crowding (neighbors within radius) for each cell at this hour
+    crowd_mat <- .compute_crowding(grid, cfg$radius)
+    crowd_vec <- crowd_mat[cbind(Cells$X, Cells$Y)]
     events_buffer[[length(events_buffer) + 1L]] <- tibble::tibble(
       step = step,
       id   = Cells$id,
       Label = Cells$Label,
+      kt = kt_strs,
       g_alloc = Cells$g_alloc,
       need = Cells$need,
       need_over_g = Cells$need_over_g,
+      crowding = as.integer(crowd_vec),
       div_event = Cells$div_event,
       death_event = Cells$death_event,
       risk_div = Cells$risk_div,
@@ -320,11 +357,11 @@ run_simulation_cfg <- function(cfg, karyolib, outputdir, prefix = "Cells", globa
       live_idx   <- which(Cells$Status == 1L)
       Cells_live <- Cells[live_idx, , drop = FALSE]
 
-      csv_path <- sprintf(paste0(outputdir, "/csv/%s_day%03d.csv"), prefix, day_index)
+      csv_path <- sprintf(paste0(outputdir, "/csv/%s_day%03d.parquet"), prefix, day_index)
       png_path <- sprintf(paste0(outputdir, "/png/%s_day%03d.png"), prefix, day_index)
 
-      # Write CSV with living cells only
-      write.csv(Cells_live, csv_path, row.names = FALSE)
+      # Write Parquet (zstd) with living cells only
+      arrow::write_parquet(Cells_live, csv_path, compression = "zstd", compression_level = 3)
 
       # Plot PNG (living cells only), no axes; Label=1 red, Label=0 green
       png(filename = png_path, width = 1000, height = 1000, units = "px")
@@ -348,8 +385,8 @@ run_simulation_cfg <- function(cfg, karyolib, outputdir, prefix = "Cells", globa
         ev_dir <- file.path(outputdir, "events")
         dir.create(ev_dir, showWarnings = FALSE, recursive = TRUE)
         ev_tbl <- dplyr::bind_rows(events_buffer)
-        ev_path <- sprintf(paste0(ev_dir, "/%s_day%03d_events.csv"), prefix, day_index)
-        write.csv(ev_tbl, ev_path, row.names = FALSE)
+        ev_path <- sprintf(paste0(ev_dir, "/%s_day%03d_events.parquet"), prefix, day_index)
+        arrow::write_parquet(ev_tbl, ev_path, compression = "zstd", compression_level = 3)
         events_buffer <- list()
       }
 
@@ -482,7 +519,7 @@ run_ABM_simulation <- function(cfg_file, karyolib_file, base_output, workers = m
       invisible(TRUE)
     },
     future.globals = FALSE,
-    future.packages = c("Rcpp","yaml","dplyr","tibble","future.apply"),
+    future.packages = c("Rcpp","yaml","dplyr","tibble","future.apply","arrow"),
     future.seed = TRUE
   )
 }
