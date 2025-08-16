@@ -236,11 +236,29 @@ run_simulation_cfg <- function(cfg, karyolib, outputdir, prefix = "Cells", globa
   dir.create(file.path(outputdir, "csv"), showWarnings = FALSE, recursive = TRUE)
   dir.create(file.path(outputdir, "png"), showWarnings = FALSE, recursive = TRUE)
   arrow::write_parquet(
-  Cells,
-  sprintf(paste0(outputdir, "/csv/%s_day%03d.parquet"), prefix, day_index),
-  compression = "zstd", compression_level = 3
-)
+    Cells,
+    sprintf(paste0(outputdir, "/csv/%s_day%03d.parquet"), prefix, day_index),
+    compression = "zstd", compression_level = 3
+  )
   cat("Day", day_index, ":", sum(Cells$Status==1L), "living cells saved\n")
+
+  # Also save Day 0 PNG snapshot (matching the 24h snapshots)
+  png_path0 <- sprintf(paste0(outputdir, "/png/%s_day%03d.png"), prefix, day_index)
+  png(filename = png_path0, width = 1000, height = 1000, units = "px")
+  op <- par(mar = c(0, 0, 0, 0), oma = c(0, 0, 2, 0), pty = "s")
+  plot(NA, xlim = c(1, cfg$N), ylim = c(1, cfg$N), axes = FALSE, xlab = "", ylab = "", asp = 1)
+  if (nrow(Cells) > 0) {
+    idx_norm <- which(Cells$Label == 0L & Cells$Status == 1L)
+    idx_tum  <- which(Cells$Label == 1L & Cells$Status == 1L)
+    if (length(idx_norm)) points(Cells$X[idx_norm], Cells$Y[idx_norm], pch = 16, cex = 1.5, col = "green")
+    if (length(idx_tum))  points(Cells$X[idx_tum],  Cells$Y[idx_tum],  pch = 16, cex = 1.5, col = "red")
+  }
+  title_txt0 <- sprintf("MSR: %s   total supply factor: %s  Day:%d",
+                       format(signif(cfg$MSR, 6), trim = TRUE),
+                       format(signif(cfg$total_supply / (cfg$N * cfg$N), 6), trim = TRUE),
+                       day_index)
+  mtext(title_txt0, side = 3, line = 0.5, adj = 0, outer = TRUE, cex = 1.2)
+  par(op); dev.off()
 
   # Build K matrix once (will be replaced by C++ returns after each hour)
   k_cols <- paste0("K", 1:22)
@@ -386,8 +404,9 @@ run_simulation_cfg <- function(cfg, karyolib, outputdir, prefix = "Cells", globa
         if (length(idx_norm)) points(Cells_live$X[idx_norm], Cells_live$Y[idx_norm], pch = 16, cex = 1.5, col = "green")
         if (length(idx_tum))  points(Cells_live$X[idx_tum],  Cells_live$Y[idx_tum],  pch = 16, cex = 1.5, col = "red")
       }
-      # Build title "total_supply: XX  Day:XX" with left alignment; use supply ratio for XX
-      title_txt <- sprintf("total supply factor: %s  Day:%d",
+      # Build title with MSR and total supply factor and day
+      title_txt <- sprintf("MSR: %s   total supply factor: %s  Day:%d",
+                           format(signif(cfg$MSR, 6), trim = TRUE),
                            format(signif(cfg$total_supply / (cfg$N * cfg$N), 6), trim = TRUE),
                            day_index)
       mtext(title_txt, side = 3, line = 0.5, adj = 0, outer = TRUE, cex = 1.2)

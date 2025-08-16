@@ -35,10 +35,17 @@
   <h1>ABM Simulation Viewer</h1>
 
   <div class="bar">
+    <label>MSR:</label>
+    <select id="msrSel"></select>
     <label>Supply:</label>
     <select id="supplySel"></select>
     <label>Simulation:</label>
     <select id="simSel"></select>
+
+    <input id="manifestPicker" type="file" accept=".csv" style="display:none" />
+    <button id="btnLoadManifest" class="pill" type="button" title="Load manifest.csv to detect MSR">Load manifest.csv</button>
+    <span class="note" id="fileHint" style="display:none">Tip: under file://, click “Load manifest.csv” or serve via http.</span>
+
     <span id="status" class="note"></span>
   </div>
 
@@ -114,13 +121,19 @@
 <script>
 /** ======= CONFIG ======= **/
 // Place this HTML next to the Results/ root; otherwise update BASE_PATH:
-const BASE_PATH = "./Results.old";
+const BASE_PATH = "./Results";
+// Try multiple base roots when probing files (helps when HTML isn't next to Results)
+const CANDIDATE_BASES = [BASE_PATH, "/Results"]; // order matters; second is absolute fallback
 
 // Supply list (adjust to your config.yaml if needed)
 // PDF aspect ratios (width/height). Adjust if your PDFs use a different size.
 const PDF_ASPECT_COUNTS = 5/3;   // e.g., 10in x 6in -> 1.6667
 const PDF_ASPECT_STREAM = 5/3;   // keep same if both exported identically
 const SUPPLIES = ["0.1","0.25","0.5","1","1.5","2"];
+
+// Optional MSR layer. If your Results tree is Results/MSR_xxx/<supply>/Sim_XXX,
+// fill this list (e.g., ["MSR_0.5","MSR_1","MSR_2"]). If empty => legacy layout.
+const MSR_DIRS = [];
 
 // Anchors defined on a reference timeline (keep proportions for any actual maxDay)
 const GUIDE_REF_TOTAL = 720;   // reference total days
@@ -166,14 +179,41 @@ const CANDIDATE_STREAM = [
   "png_karyo/Karyotype_stream_union99.png"
 ];
 
-// Fixed naming pattern for day images (row 3)
-const CELLS_PATH   = (supply, sim, day) => {
-  const m = sim.match(/Sim_(\d{3})$/);
+// MSR-aware root path, legacy-compatible when msr is null/LEGACY
+const ROOT_PATH = (msr, supply, sim) => (
+  msr && msr !== 'LEGACY'
+    ? `${BASE_PATH}/${msr}/${encodeURIComponent(supply)}/${sim}`
+    : `${BASE_PATH}/${encodeURIComponent(supply)}/${sim}`
+);
+
+// Backward-compatible varargs:
+//   CELLS_PATH(supply, sim, day)           // legacy
+//   CELLS_PATH(msr, supply, sim, day)      // new (explicit MSR)
+function CELLS_PATH(){
+  let msr, supply, sim, day;
+  if (arguments.length === 3) {
+    [supply, sim, day] = arguments;
+    msr = (window.current && window.current.msr) ? window.current.msr : null;
+  } else {
+    [msr, supply, sim, day] = arguments;
+  }
+  const m = String(sim||'').match(/Sim_(\d{3})$/);
   const rep = m ? m[1] : "001";
-  const sup = encodeURIComponent(supply);
-  return `${BASE_PATH}/${sup}/${sim}/png/Cells_supply_${supply}_rep${rep}_day${day}.png`;
-};
-const KARYO_PATH   = (supply, sim, day) => `${BASE_PATH}/${encodeURIComponent(supply)}/${sim}/png_karyo/Cells_karyo_day${day}.png`;
+  const base = ROOT_PATH(msr, supply, sim);
+  return `${base}/png/Cells_supply_${supply}_rep${rep}_day${day}.png`;
+}
+
+function KARYO_PATH(){
+  let msr, supply, sim, day;
+  if (arguments.length === 3) {
+    [supply, sim, day] = arguments;
+    msr = (window.current && window.current.msr) ? window.current.msr : null;
+  } else {
+    [msr, supply, sim, day] = arguments;
+  }
+  const base = ROOT_PATH(msr, supply, sim);
+  return `${base}/png_karyo/Cells_karyo_day${day}.png`;
+}
 
 // Utilities
 const $ = sel => document.querySelector(sel);
@@ -198,46 +238,18 @@ function checkImg(url, timeout=5000){
 // Format 1 -> "001"
 function pad3(n){ n = parseInt(n,10)||0; return String(n).padStart(3,"0"); }
 
-// Detect available Sim_* (1..50); if day001.png exists, mark as available
-async function detectSims(supply){
-  const sims = [];
-  console.log("[detectSims] supply=", supply, "BASE_PATH=", BASE_PATH);
-  for(let i=1; i<=50; i++){
-    const sim = `Sim_${String(i).padStart(3,"0")}`;
-    const testUrl = CELLS_PATH(supply, sim, "001");
-    /* eslint no-await-in-loop: 0 */
-    const ok = await checkImg(testUrl, 1500);
-    if(ok) sims.push(sim);
+// resolveOne(supply, sim, candidates)                // legacy
+// resolveOne(msr, supply, sim, candidates)           // new
+async function resolveOne(a, b, c, d){
+  let msr, supply, sim, candidates;
+  if (d === undefined) { // legacy signature
+    msr = (window.current && window.current.msr) ? window.current.msr : null;
+    supply = a; sim = b; candidates = c;
+  } else {               // new signature
+    msr = a; supply = b; sim = c; candidates = d;
   }
-  return sims;
-}
-
-// For a given sim, detect max day (exponential search + binary search)
-async function detectMaxDay(supply, sim){
-  // 指数增长直到失败
-  let lo = 1, hi = 1;
-  while(true){
-    const ok = await checkImg(CELLS_PATH(supply, sim, pad3(hi)), 1200);
-    if(!ok) break;
-    lo = hi;
-    hi *= 2;
-    if(hi > 4096) break;
-  }
-  // 二分查找最后成功
-  let L = lo, R = hi - 1;
-  while(L < R){
-    const mid = Math.ceil((L+R+1)/2);
-    /* eslint no-await-in-loop: 0 */
-    const ok = await checkImg(CELLS_PATH(supply, sim, pad3(mid)), 800);
-    if(ok) L = mid; else R = mid - 1;
-  }
-  return Math.max(1, L);
-}
-
-// Pick the first existing path from candidates
-async function resolveOne(supply, sim, candidates){
   for (const rel of candidates) {
-    const base = `${BASE_PATH}/${encodeURIComponent(supply)}/${sim}/`;
+    const base = `${ROOT_PATH(msr, supply, sim)}/`;
     const url  = `${base}${rel}`;
     const isPdf = /\.pdf$/i.test(rel);
 
@@ -268,6 +280,52 @@ async function resolveOne(supply, sim, candidates){
     if (ok) return url;
   }
   return null;
+}
+
+async function detectSims(a, b){
+  let msr, supply;
+  if (b === undefined) { // legacy: (supply)
+    msr = (window.current && window.current.msr) ? window.current.msr : null;
+    supply = a;
+  } else {               // new: (msr, supply)
+    msr = a; supply = b;
+  }
+  const sims = [];
+  console.log("[detectSims] msr=", msr, "supply=", supply, "BASE_PATH=", BASE_PATH);
+  for(let i=1; i<=50; i++){
+    const sim = `Sim_${String(i).padStart(3,"0")}`;
+    const testUrl = CELLS_PATH(msr, supply, sim, "001");
+    /* eslint no-await-in-loop: 0 */
+    const ok = await checkImg(testUrl, 1500);
+    if(ok) sims.push(sim);
+  }
+  return sims;
+}
+
+async function detectMaxDay(a, b, c){
+  let msr, supply, sim;
+  if (c === undefined) { // legacy: (supply, sim)
+    msr = (window.current && window.current.msr) ? window.current.msr : null;
+    supply = a; sim = b;
+  } else {               // new: (msr, supply, sim)
+    msr = a; supply = b; sim = c;
+  }
+  // exponential grow until failure
+  let lo = 1, hi = 1;
+  while(true){
+    const ok = await checkImg(CELLS_PATH(msr, supply, sim, pad3(hi)), 1200);
+    if(!ok) break;
+    lo = hi; hi *= 2; if(hi > 4096) break;
+  }
+  // binary search last success
+  let L = lo, R = hi - 1;
+  while(L < R){
+    const mid = Math.ceil((L+R+1)/2);
+    /* eslint no-await-in-loop: 0 */
+    const ok = await checkImg(CELLS_PATH(msr, supply, sim, pad3(mid)), 800);
+    if(ok) L = mid; else R = mid - 1;
+  }
+  return Math.max(1, L);
 }
 
 // Draw vertical guide on overlay (map [0..maxDay] to container width)
@@ -340,6 +398,9 @@ const ovlFunnel = $("#ovlFunnel");
 const ovlStream = $("#ovlStream");
 const imgCells  = $("#imgCells");
 const imgKaryo  = $("#imgKaryo");
+
+const manifestPicker = document.getElementById('manifestPicker');
+const btnLoadManifest = document.getElementById('btnLoadManifest');
 
 const embFunnel = document.getElementById("embFunnel");
 const embStream = document.getElementById("embStream");
@@ -502,9 +563,10 @@ function initSupplies(){
 async function refreshSims(){
   setStatus("Detecting simulations…");
   simSel.innerHTML = "";
-  const sims = await detectSims(current.supply);
+  const sims = await detectSims(current.msr, current.supply);
   if(sims.length === 0){
-    setStatus("No simulations detected for this supply.", true);
+    const hint = (location.protocol === 'file:') ? ' (Tip: click “Load manifest.csv” or run a local server, e.g. python -m http.server)' : '';
+    setStatus(`No simulations detected for ${current.msr||'LEGACY'}/${current.supply}.${hint}`, true);
     return;
   }
   sims.forEach(s=>{
@@ -519,7 +581,7 @@ async function refreshSims(){
 stopPlayback();
 async function refreshMaxDayAndImages(){
   setStatus("Scanning max day…");
-  current.maxDay = await detectMaxDay(current.supply, current.sim);
+  current.maxDay = await detectMaxDay(current.msr, current.supply, current.sim);
   daySlider.max = String(current.maxDay);
   dayMaxEl.textContent = String(current.maxDay);
 
@@ -537,8 +599,8 @@ async function refreshMaxDayAndImages(){
 
   // Resolve summary charts
   setStatus("Loading summary charts…");
-  current.funnelUrl = await resolveOne(current.supply, current.sim, CANDIDATE_FUNNEL);
-  current.streamUrl = await resolveOne(current.supply, current.sim, CANDIDATE_STREAM);
+  current.funnelUrl = await resolveOne(current.msr, current.supply, current.sim, CANDIDATE_FUNNEL);
+  current.streamUrl = await resolveOne(current.msr, current.supply, current.sim, CANDIDATE_STREAM);
   if(current.funnelUrl) setSummaryMedia('funnel', current.funnelUrl);
   if(current.streamUrl) setSummaryMedia('stream', current.streamUrl);
   setStatus("");
@@ -553,8 +615,8 @@ async function refreshMaxDayAndImages(){
 function updateDayImages(){
   const imgDay = Math.max(1, current.day); // images start at day001
   const d = pad3(imgDay);
-  imgCells.src = CELLS_PATH(current.supply, current.sim, d);
-  imgKaryo.src = KARYO_PATH(current.supply, current.sim, d);
+  imgCells.src = CELLS_PATH(current.msr, current.supply, current.sim, d);
+  imgKaryo.src = KARYO_PATH(current.msr, current.supply, current.sim, d);
   dayVal.textContent = String(current.day);
   // Update guides for the top two charts
   drawGuide(ovlFunnel, current.day, current.maxDay);
@@ -618,6 +680,33 @@ selSpeed?.addEventListener('change', ()=>{
   }
 });
 
+btnLoadManifest?.addEventListener('click', ()=> manifestPicker?.click());
+
+manifestPicker?.addEventListener('change', async (e)=>{
+  const file = e.target.files && e.target.files[0];
+  if (!file) return;
+  const txt = await loadManifestFromPicker(file);
+  if (!txt){
+    setStatus('Failed to read manifest.csv', true);
+    return;
+  }
+  const msrs = parseMsrFromCsvText(txt);
+  if (msrs.length === 0){
+    setStatus('No MSR detected in manifest.csv', true);
+    return;
+  }
+  applyMsrOptions(msrs);
+
+  // MSR changed => refresh everything downstream
+  stopPlayback();
+  clearSummaryMedia();
+  await refreshSims();
+  await refreshMaxDayAndImages();
+  setStatus('MSR loaded from local manifest.csv');
+});
+
+
+
 // Redraw overlay when window resizes
 attachRedrawOnResize(imgFunnel, ovlFunnel, ()=>({day:current.day, maxDay:current.maxDay}));
 attachRedrawOnResize(imgStream, ovlStream, ()=>({day:current.day, maxDay:current.maxDay}));
@@ -625,8 +714,225 @@ attachRedrawOnResize(imgStream, ovlStream, ()=>({day:current.day, maxDay:current
 if(embFunnel) embFunnel.addEventListener('load', ()=> drawGuide(ovlFunnel, current.day, current.maxDay));
 if(embStream) embStream.addEventListener('load', ()=> drawGuide(ovlStream, current.day, current.maxDay));
 
+// ========== MSR support ==========
+// --- MSR detection helpers (directory-index independent) ---
+// Multi-base fetchers: try each base until one works
+async function fetchTextIfOk(url){
+  try{ const r = await fetch(url); if(!r.ok) return null; return await r.text(); }
+  catch(e){ return null; }
+}
+async function fetchJsonIfOk(url){
+  try{ const r = await fetch(url, {headers:{'Accept':'application/json'}}); if(!r.ok) return null; return await r.json(); }
+  catch(e){ return null; }
+}
+async function fetchFromBasesText(rel){
+  for (const base of CANDIDATE_BASES){
+    const txt = await fetchTextIfOk(`${base}/${rel}`);
+    if (txt != null) return {base, txt};
+  }
+  return {base:null, txt:null};
+}
+async function fetchFromBasesJson(rel){
+  for (const base of CANDIDATE_BASES){
+    const js = await fetchJsonIfOk(`${base}/${rel}`);
+    if (js != null) return {base, js};
+  }
+  return {base:null, js:null};
+}
+
+function smartSplitLine(line){
+  // handle comma, semicolon, or tab delimiters; remove outer quotes
+  if (line.indexOf('\t') >= 0) return line.split('\t').map(s=>s.replace(/^"|"$/g,'').trim());
+  if (line.indexOf(';')  >= 0) return line.split(';').map(s=>s.replace(/^"|"$/g,'').trim());
+  return line.split(',').map(s=>s.replace(/^"|"$/g,'').trim());
+}
+
+function normalizeMsrFromPair(msrVal, msrLab){
+  const numFrom = (s)=>{
+    if(s==null) return null;
+    let t=String(s).trim().replace(/^\uFEFF/, '');
+    const m = t.match(/[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?/);
+    if(!m) return null;
+    const n = Number(m[0]);
+    if(!Number.isFinite(n)) return null;
+    let str = m[0];
+    if(/[eE]/.test(str)) str = n.toString();
+    if(str.includes('.')) str = str.replace(/0+$/,'').replace(/\.$/,'');
+    return str;
+  };
+  const cleanLabel = (s)=>{
+    if(!s) return null;
+    let t=String(s).trim().replace(/^\uFEFF/, '');
+    const num = numFrom(t);
+    if(num!=null) return `MSR_${num}`;
+    t = t.replace(/^MSR[\s_-]*/i,'');
+    t = t.replace(/[^A-Za-z0-9._-]+/g,'_').replace(/_+/g,'_').replace(/^_|_$/g,'');
+    if(!t) return null;
+    return `MSR_${t}`;
+  };
+  const num = numFrom(msrVal);
+  if(num!=null) return `MSR_${num}`;
+  const lab = cleanLabel(msrLab);
+  if(lab) return lab;
+  return cleanLabel(msrVal);
+}
+
+function parseCsvUniqueMsrLabels(text){
+  if(!text) return [];
+  const lines = text.split(/\r?\n/).filter(Boolean);
+  if(lines.length === 0) return [];
+  if (lines.length > 0) lines[0] = lines[0].replace(/^\uFEFF/, "");
+  const hdr = smartSplitLine(lines[0]).map(s=>s.toLowerCase());
+  const idxLabel = hdr.findIndex(h=>/^(msr_?label|msr_?dir)$/i.test(h));
+  const idxValue = hdr.findIndex(h=>/^(msr(_?value)?|msr_ratio|msrval)$/i.test(h));
+  console.log('[MSR manifest] header:', hdr, 'idxLabel=', idxLabel, 'idxValue=', idxValue);
+  const set = new Set();
+  for(let i=1;i<lines.length;i++){
+    const cells = smartSplitLine(lines[i]);
+    const msrVal = idxValue>=0 ? cells[idxValue] : null;
+    const msrLab = idxLabel>=0 ? cells[idxLabel] : null;
+    const lab = normalizeMsrFromPair(msrVal, msrLab);
+    if(lab) set.add(lab);
+  }
+  const arr = Array.from(set);
+  const numOf = s => {
+    const m = String(s).match(/MSR_([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)/i);
+    return m ? Number(m[1]) : NaN;
+  };
+  arr.sort((a,b)=>{
+    const na=numOf(a), nb=numOf(b);
+    if(Number.isFinite(na) && Number.isFinite(nb)) return na-nb;
+    if(Number.isFinite(na)) return -1;
+    if(Number.isFinite(nb)) return 1;
+    return a.localeCompare(b);
+  });
+  return arr;
+}
+
+async function discoverMsrDirs(){
+  // 1) Config takes precedence
+  if(Array.isArray(window.MSR_DIRS) && window.MSR_DIRS.length>0){
+    console.log('[MSR] Using configured MSR_DIRS:', window.MSR_DIRS);
+    return Array.from(new Set(window.MSR_DIRS));
+  }
+  // 2) JSON index (optional)
+  {
+    const {base, js} = await fetchFromBasesJson('msr_index.json');
+    if (Array.isArray(js) && js.length>0){
+      console.log('[MSR] Loaded from JSON index at base', base, js);
+      return Array.from(new Set(js.map(s=>String(s))));
+    }
+  }
+  // 3) Manifest CSV
+  {
+    const {base, txt} = await fetchFromBasesText('manifest.csv');
+    const byCsv = parseCsvUniqueMsrLabels(txt);
+    if (byCsv.length>0){
+      console.log('[MSR] Parsed from manifest.csv at base', base, byCsv);
+      return byCsv;
+    }
+  }
+  // 4) Directory index fallback
+  for (const base of CANDIDATE_BASES){
+    const idx = await fetchTextIfOk(`${base}/`);
+    if(idx){
+      const re = /MSR_[A-Za-z0-9_.+-]+\/?/g;
+      const hits = (idx.match(re) || []).map(s=>s.replace(/\/?$/,'')).filter(Boolean);
+      const uniq = Array.from(new Set(hits.filter(s=>s.startsWith('MSR_'))));
+      if(uniq.length>0){
+        console.log('[MSR] Found by directory listing at base', base, uniq);
+        return uniq;
+      }
+    }
+  }
+  console.warn('[MSR] No MSR layer detected; falling back to legacy');
+  return [];
+}
+
+// Populate MSR layer dropdown if present (auto-detect MSR_ dirs)
+const msrSel = document.getElementById('msrSel');
+
+
+// Local manifest (file:// fallback)
+function parseMsrFromCsvText(text){
+  try {
+    return parseCsvUniqueMsrLabels(text); // reuse existing robust CSV/TSV parser
+  } catch(e){
+    console.error('[MSR] Failed to parse local manifest.csv:', e);
+    return [];
+  }
+}
+function applyMsrOptions(msrs){
+  const msrSel = document.getElementById('msrSel');
+  if (!msrSel) return;
+  if (!msrs || msrs.length === 0){
+    msrSel.innerHTML = '<option value="LEGACY">(no MSR layer)</option>';
+    current.msr = null;
+  } else {
+    const uniq = Array.from(new Set(msrs));
+    msrSel.innerHTML = uniq.map(v=>`<option value="${v}">${v}</option>`).join('');
+    // keep previous if still present, else first
+    if (current.msr && uniq.includes(current.msr)){
+      msrSel.value = current.msr;
+    } else {
+      current.msr = uniq[0];
+      msrSel.value = current.msr;
+    }
+  }
+}
+async function loadManifestFromPicker(file){
+  return new Promise((resolve)=>{
+    const fr = new FileReader();
+    fr.onload  = () => resolve(String(fr.result||''));
+    fr.onerror = () => resolve(null);
+    fr.readAsText(file);
+  });
+}
+
+
+
+async function populateMSR(){
+  const msrSel = document.getElementById('msrSel');
+  if (!msrSel) return;
+
+  const isFileProto = location.protocol === 'file:';
+  let msrs = [];
+
+  // Normal discovery path (works under http/https)
+  if (!isFileProto){
+    msrs = await discoverMsrDirs();
+  }
+
+  if (msrs && msrs.length > 0){
+    applyMsrOptions(msrs);
+    return;
+  }
+
+  // file:// or discovery failed: show LEGACY and wait for user to pick manifest.csv
+  console.warn('[MSR] Running under file:// or discovery failed; please click "Load manifest.csv"');
+  applyMsrOptions([]); // show LEGACY until user supplies manifest
+}
+
+if (msrSel){
+  msrSel.addEventListener('change', async ()=>{
+    stopPlayback();
+    current.msr = (msrSel.value === 'LEGACY') ? null : msrSel.value;
+    // Reset timeline
+    current.day = 0;
+    daySlider.value = '0';
+    dayVal.textContent = '0';
+    clearSummaryMedia();
+    await refreshSims();
+    await refreshMaxDayAndImages();
+  });
+}
+
 // boot
 (async function boot(){
+  console.log('[BOOT] BASE_PATH =', BASE_PATH, 'CANDIDATE_BASES =', CANDIDATE_BASES);
+  await populateMSR();
+  const fileHint = document.getElementById('fileHint');
+  if (fileHint) fileHint.style.display = (location.protocol === 'file:') ? 'inline' : 'none';
   initSupplies();
   await refreshSims();
   await refreshMaxDayAndImages();
