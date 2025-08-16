@@ -14,6 +14,7 @@ library(stringr)
 library(Rcpp)
 library(future.apply)
 library(arrow)   # ← NEW: for Parquet I/O
+library(ragg)   # high-quality PNG device with compression support
 
 
 # Avoid serializing external pointers and reloading on workers
@@ -221,7 +222,11 @@ run_simulation_cfg <- function(cfg, karyolib, outputdir, prefix = "Cells", globa
   # day 0 snapshot
   dir.create(file.path(outputdir, "csv"), showWarnings = FALSE, recursive = TRUE)
   dir.create(file.path(outputdir, "png"), showWarnings = FALSE, recursive = TRUE)
-  write.csv(Cells, sprintf(paste0(outputdir, "/csv/%s_day%03d.csv"), prefix, day_index), row.names = FALSE)
+  arrow::write_parquet(
+  Cells,
+  sprintf(paste0(outputdir, "/csv/%s_day%03d.parquet"), prefix, day_index),
+  compression = "zstd", compression_level = 3
+)
   cat("Day", day_index, ":", sum(Cells$Status==1L), "living cells saved\n")
 
   # Build K matrix once (will be replaced by C++ returns after each hour)
@@ -352,11 +357,11 @@ run_simulation_cfg <- function(cfg, karyolib, outputdir, prefix = "Cells", globa
       live_idx   <- which(Cells$Status == 1L)
       Cells_live <- Cells[live_idx, , drop = FALSE]
 
-      csv_path <- sprintf(paste0(outputdir, "/csv/%s_day%03d.csv"), prefix, day_index)
+      csv_path <- sprintf(paste0(outputdir, "/csv/%s_day%03d.parquet"), prefix, day_index)
       png_path <- sprintf(paste0(outputdir, "/png/%s_day%03d.png"), prefix, day_index)
 
-      # Write CSV with living cells only
-      write.csv(Cells_live, csv_path, row.names = FALSE)
+      # Write Parquet (zstd) with living cells only
+      arrow::write_parquet(Cells_live, csv_path, compression = "zstd", compression_level = 3)
 
       # Plot PNG (living cells only), no axes; Label=1 red, Label=0 green
       png(filename = png_path, width = 1000, height = 1000, units = "px")

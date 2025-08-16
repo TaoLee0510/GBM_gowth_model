@@ -29,4 +29,4 @@ DTr: 0.2                      # tumor cells Glu death proportion
 DNr: 0.05                      # normal cells Glu death proportion
 supply_mode: proportional_prob   # resource allocation: "proportional","equal", "proportional_typewise", "proportional_prob", "proportional_typewise_prob"
 replicates: 5                  # number of replicates
-Time: 17280                 # total simulation time in hours (termination criterion)
+Time: 43800                 # total simulation time in hours (termination criterion)

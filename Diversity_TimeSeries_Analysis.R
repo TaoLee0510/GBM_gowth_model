@@ -7,12 +7,12 @@
 
 suppressPackageStartupMessages({
   library(dplyr); library(readr); library(stringr); library(purrr)
-  library(tidyr); library(ggplot2); library(forcats)
+  library(tidyr); library(ggplot2); library(forcats); library(arrow); library(ragg)
 })
 
 # ---- Helpers ----
 .parse_day <- function(fname) {
-  m <- stringr::str_match(basename(fname), "_day(\\d+)\\.csv$")
+  m <- stringr::str_match(basename(fname), "_day(\\d+)\\.(parquet|csv)$")
   as.integer(m[,2])
 }
 
@@ -21,6 +21,23 @@ suppressPackageStartupMessages({
 .kt_str <- function(df_kt_cols) {
   # df_kt_cols: data.frame with columns K1..K22
   as.character(do.call(paste, c(df_kt_cols, list(sep = "."))))
+}
+
+# List daily snapshot files (prefer Parquet over legacy CSV)
+.list_daily_files <- function(dir_path) {
+  fpq <- list.files(dir_path, pattern = "_day\\d+\\.parquet$", full.names = TRUE)
+  if (length(fpq) > 0) return(fpq[order(.parse_day(fpq))])
+  fcsv <- list.files(dir_path, pattern = "_day\\d+\\.csv$", full.names = TRUE)
+  fcsv[order(.parse_day(fcsv))]
+}
+
+# Read a daily snapshot regardless of format
+.read_daily_file <- function(f) {
+  if (grepl("\\.parquet$", f, ignore.case = TRUE)) {
+    as_tibble(arrow::read_parquet(f))
+  } else {
+    readr::read_csv(f, show_col_types = FALSE, progress = FALSE, col_types = cols())
+  }
 }
 
 # Fixed color map for karyotypes (from karyotype library CSV)
@@ -46,15 +63,13 @@ suppressPackageStartupMessages({
 #
 # ---- (1) Compute diversity over time for a single simulation (one csv directory) ----
 compute_diversity_for_csv_dir <- function(csv_dir) {
-  files <- list.files(csv_dir, pattern = "_day\\d+\\.csv$", full.names = TRUE)
+  files <- .list_daily_files(csv_dir)
   if (length(files) == 0) return(tibble())
-  files <- files[order(.parse_day(files))]
 
   purrr::map_dfr(files, function(f) {
     day <- .parse_day(f)
-    df  <- readr::read_csv(f, show_col_types = FALSE, progress = FALSE, col_types = cols())
-    if (!all(.kt_cols() %in% names(df)))
-      return(tibble(day = day, H = NA_real_, Simpson = NA_real_, Entropy = NA_real_, Richness = NA_integer_))
+    df  <- .read_daily_file(f)
+    if (!all(.kt_cols() %in% names(df))) return(tibble())
     kt  <- .kt_str(df[, .kt_cols(), drop = FALSE])
     counts <- as.integer(table(kt))
     mets <- .diversity_from_counts(counts)
@@ -103,7 +118,8 @@ plot_diversity_boxplots <- function(div_all, out_path = NULL) {
       coord_cartesian(ylim = c(0, 1.5)) +
     labs(x = "Day bin (30 days)", y = "Entropy (Shannon)",
          title = "Entropy over time across replicates (30-day bins)") +
-    theme_bw()
+    theme_bw()+
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
   if (!is.null(out_path)) ggsave(out_path, p, width = 12, height = 8, device = cairo_pdf)
   p
 }
@@ -130,25 +146,21 @@ plot_diversity_boxplots_simpson <- function(div_all, out_path = NULL) {
     coord_cartesian(ylim = c(0, 1.5)) +
     labs(x = "Day bin (30 days)", y = "Simpson diversity (1 - λ)",
          title = "Simpson diversity over time across replicates (30-day bins)") +
-    theme_bw()
+    theme_bw()+
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
   if (!is.null(out_path)) ggsave(out_path, p, width = 12, height = 8, device = cairo_pdf)
   p
 }
 #
 # ---- (2) G distribution over time for a single simulation: violin plot ----
 plot_G_violin_for_sim <- function(csv_dir, out_path, sample_cells = 5000) {
-  files <- list.files(csv_dir, pattern = "_day\\d+\\.csv$", full.names = TRUE)
+  files <- .list_daily_files(csv_dir)
   if (length(files) == 0) return(invisible(NULL))
-  files <- files[order(.parse_day(files))]
-
   g_tbl <- purrr::map_dfr(files, function(f) {
     day <- .parse_day(f)
-    df <- readr::read_csv(
-      f, show_col_types = FALSE, progress = FALSE,
-      col_types = cols(G = col_double(), Label = col_integer())
-    )
+    df <- .read_daily_file(f)
     if (!all(c("G","Label") %in% names(df))) return(tibble())
-    df <- dplyr::filter(df, Label == 1L)  # tumor-only
+    df <- dplyr::filter(df, Label == 1L)
     if (nrow(df) == 0) return(tibble())
     if (nrow(df) > sample_cells) df <- df[sample.int(nrow(df), sample_cells), , drop = FALSE]
     tibble(day = day, G = df$G)
@@ -184,14 +196,15 @@ plot_G_violin_for_sim <- function(csv_dir, out_path, sample_cells = 5000) {
     #         vjust = -0.9, size = 2.8, inherit.aes = FALSE) +
     labs(x = "Day bin (30 days)", y = "G",
          title = "Distribution of G over time (30-day bins, per simulation)") +
-    theme_bw()
+    theme_bw()+
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
   ggsave(out_path, p, width = 10, height = 5)
   p
 }
 
 # ---- (2b) Tumor/normal scatter per day with fixed karyotype colors ----
 plot_karyotype_colored_scatter_for_sim <- function(csv_dir, out_dir) {
-  files <- list.files(csv_dir, pattern = "_day\\d+\\.csv$", full.names = TRUE)
+  files <- .list_daily_files(csv_dir)
   if (length(files) == 0) return(invisible(NULL))
   files <- files[order(.parse_day(files))]
   dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
@@ -203,7 +216,7 @@ plot_karyotype_colored_scatter_for_sim <- function(csv_dir, out_dir) {
 
   for (f in files) {
     day <- .parse_day(f)
-    df  <- readr::read_csv(f, show_col_types = FALSE, progress = FALSE, col_types = cols())
+    df <- .read_daily_file(f)
     if (!all(c("X","Y","Label", .kt_cols()) %in% names(df))) next
     df$Label <- as.integer(df$Label) # Ensure Label is integer (0/1)
 
@@ -245,13 +258,13 @@ plot_karyotype_colored_scatter_for_sim <- function(csv_dir, out_dir) {
 #
 # ---- (3) Karyotype proportions over time for a single simulation: stacked area plot (merge all but Top-N as Other) ----
 compute_karyotype_proportions <- function(csv_dir, top_n = 12) {
-  files <- list.files(csv_dir, pattern = "_day\\d+\\.csv$", full.names = TRUE)
+  files <- .list_daily_files(csv_dir)
   if (length(files) == 0) return(tibble())
   files <- files[order(.parse_day(files))]
 
   by_day <- purrr::map_dfr(files, function(f) {
     day <- .parse_day(f)
-    df  <- readr::read_csv(f, show_col_types = FALSE, progress = FALSE, col_types = cols())
+    df  <- .read_daily_file(f)
     if (!all(c(.kt_cols(), "Label") %in% names(df))) return(tibble())
     df <- df %>% filter(Label == 1L)  # tumor only
     if (nrow(df) == 0) return(tibble())
@@ -312,11 +325,11 @@ plot_karyotype_stream_for_sim <- function(csv_dir, out_path) {
 
 # gather karyotype and sort by numeric order
 compute_all_karyotypes_for_sim <- function(csv_dir) {
-  files <- list.files(csv_dir, pattern = "_day\\d+\\.csv$", full.names = TRUE)
+  files <- .list_daily_files(csv_dir)
   if (length(files) == 0) return(character(0))
   files <- files[order(.parse_day(files))]
   levs <- purrr::map(files, function(f) {
-    df <- readr::read_csv(f, show_col_types = FALSE, progress = FALSE, col_types = cols())
+    df <- .read_daily_file(f)
     if (!all(c(.kt_cols(), "Label") %in% names(df))) return(character(0))
     df$Label <- as.integer(df$Label) # Ensure Label is integer (0/1)
     df <- dplyr::filter(df, Label == 1L)
@@ -402,14 +415,14 @@ compute_all_karyotypes_for_sim <- function(csv_dir) {
 }
 
 compute_karyotype_counts_union99 <- function(csv_dir) {
-  files <- list.files(csv_dir, pattern = "_day\\d+\\.csv$", full.names = TRUE)
+  files <- .list_daily_files(csv_dir)
   if (length(files) == 0) return(tibble())
   files <- files[order(.parse_day(files))]
 
   # Collect counts per day for tumor-only
   by_day <- purrr::map_dfr(files, function(f) {
     day <- .parse_day(f)
-    df  <- readr::read_csv(f, show_col_types = FALSE, progress = FALSE, col_types = cols())
+    df <- .read_daily_file(f)
     if (!all(c(.kt_cols(), "Label") %in% names(df))) return(tibble())
     df$Label <- as.integer(df$Label) 
     df <- dplyr::filter(df, Label == 1L)
