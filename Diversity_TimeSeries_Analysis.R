@@ -8,6 +8,7 @@
 suppressPackageStartupMessages({
   library(dplyr); library(readr); library(stringr); library(purrr)
   library(tidyr); library(ggplot2); library(forcats); library(arrow); library(ragg)
+  library(future.apply)
 })
 
 # ---- Helpers ----
@@ -80,24 +81,124 @@ compute_diversity_for_csv_dir <- function(csv_dir) {
 #
 # ---- (1a) Aggregate diversity over all simulations under Results/ (group by supply) ----
 collect_diversity_across_results <- function(results_root) {
+  # 仅在这个根目录聚合：results_root/<supply>/Sim_XXX
   supply_dirs <- list.dirs(results_root, full.names = TRUE, recursive = FALSE)
-  purrr::map_dfr(supply_dirs, function(sup) {
-    sim_dirs <- list.dirs(sup, full.names = TRUE, recursive = FALSE)
-    purrr::map_dfr(sim_dirs, function(sim) {
-      csv_dir <- file.path(sim, "csv")
-      if (!dir.exists(csv_dir)) return(tibble())
-      dd <- compute_diversity_for_csv_dir(csv_dir)
-      if (nrow(dd) == 0) return(tibble())
-      dd %>% mutate(supply = basename(sup), sim_id = basename(sim))
-    })
+  supply_dirs <- supply_dirs[dir.exists(supply_dirs)]
+  if (length(supply_dirs) == 0) return(tibble())
+
+  sim_tbl <- purrr::map_dfr(supply_dirs, function(sup) {
+    sims <- list.dirs(sup, full.names = TRUE, recursive = FALSE)
+    sims <- sims[grepl("^Sim_\\d{3}$", basename(sims))]
+    if (length(sims) == 0) return(tibble())
+    tibble(sim_dir = sims, supply = basename(sup))
   })
+  if (nrow(sim_tbl) == 0) return(tibble())
+
+  message("[collect_diversity] root=", basename(results_root),
+        " supplies=", length(unique(sim_tbl$supply)),
+        " sims=", nrow(sim_tbl))
+
+  need_local_plan <- FALSE
+  if (future::nbrOfWorkers() <= 1L) {
+    need_local_plan <- TRUE
+    future::plan(future::multisession, workers = max(1L, parallel::detectCores() - 2L))
+  }
+  on.exit({ if (need_local_plan) future::plan(future::sequential) }, add = TRUE)
+
+  res <- future.apply::future_lapply(seq_len(nrow(sim_tbl)), function(i) {
+    sim <- sim_tbl$sim_dir[i]
+    csv_dir <- file.path(sim, "csv")
+    if (!dir.exists(csv_dir)) return(tibble())
+    dd <- compute_diversity_for_csv_dir(csv_dir)
+    if (nrow(dd) == 0) return(tibble())
+    dd %>% mutate(supply = sim_tbl$supply[i], sim_id = basename(sim))
+  }, future.seed = TRUE)
+
+  bind_rows(res)
+}
+
+# ---- Override run_diversity_timeseries to support MSR layer ----
+run_diversity_timeseries <- function(base_output,
+                                     sample_cells = 5000,
+                                     do_diversity = TRUE,
+                                     do_per_sim  = TRUE) {
+  results_root <- file.path(base_output, "Results")
+
+  # 识别 MSR 层；没有则用 legacy 单层
+  msr_dirs <- list.dirs(results_root, full.names = TRUE, recursive = FALSE)
+  msr_dirs <- msr_dirs[grepl("^MSR_", basename(msr_dirs))]
+  if (length(msr_dirs) == 0) msr_dirs <- results_root
+
+  for (root_lvl in msr_dirs) {
+    message("[run_diversity_timeseries] Processing root: ", root_lvl)
+    # (1) 各 supply 的多仿真聚合（只在当前 root_lvl 中聚合与输出）
+    if (isTRUE(do_diversity)) {
+      div_all <- collect_diversity_across_results(root_lvl)
+      if (nrow(div_all) > 0) {
+        out_pdf_e <- file.path(root_lvl, "diversity_boxplots_by_supply_Entropy.pdf")
+        out_pdf_s <- file.path(root_lvl, "diversity_boxplots_by_supply_Simpson.pdf")
+        try(plot_diversity_boxplots(div_all, out_pdf_e), silent = TRUE)
+        try(plot_diversity_boxplots_simpson(div_all, out_pdf_s), silent = TRUE)
+      }
+    }
+
+    # (2) 每个仿真独立出图（并行），范围限定在当前 root_lvl 下
+    if (isTRUE(do_per_sim)) {
+      supply_dirs <- list.dirs(root_lvl, full.names = TRUE, recursive = FALSE)
+      supply_dirs <- supply_dirs[dir.exists(supply_dirs)]
+      supply_dirs <- supply_dirs[!grepl("^\\.", basename(supply_dirs))]
+      # 只保留确实含有 Sim_XXX 的供给目录
+      supply_dirs <- supply_dirs[vapply(supply_dirs, function(sup){
+        any(grepl("^Sim_\\d{3}$", basename(list.dirs(sup, full.names = TRUE, recursive = FALSE))))
+      }, logical(1))]
+
+      sims_all <- purrr::map(supply_dirs, function(sup) {
+        sims <- list.dirs(sup, full.names = TRUE, recursive = FALSE)
+        sims <- sims[grepl("^Sim_\\d{3}$", basename(sims))]
+        # 要求存在 csv 子目录（每日快照）
+        sims[file.exists(file.path(sims, "csv"))]
+      }) %>% unlist(use.names = FALSE)
+
+      message("[run_diversity_timeseries] root=", basename(root_lvl),
+              " supply_dirs=", length(supply_dirs),
+              " sims=", length(sims_all))
+
+      if (length(sims_all) > 0) {
+        .process_one_sim <- function(sim) {
+          csv_dir <- file.path(sim, "csv")
+          if (!dir.exists(csv_dir)) return(invisible(NULL))
+          out_ana <- file.path(sim, "analysis"); dir.create(out_ana, recursive = TRUE, showWarnings = FALSE)
+
+          # G violin（仅肿瘤 & 30 天分箱；函数内部已按天数自适应宽度）
+          try(plot_G_violin_for_sim(csv_dir, file.path(out_ana, "G_violin_over_time.pdf"),
+                                    sample_cells = sample_cells), silent = TRUE)
+          # Karyotype（union99）两张
+          try(plot_karyotype_stream_for_sim(csv_dir, file.path(out_ana, "Karyotype_stream_union99.pdf")), silent = TRUE)
+          try(plot_karyotype_counts_funnel_for_sim(csv_dir, file.path(out_ana, "Karyotype_counts_funnel_union99.pdf")), silent = TRUE)
+          # png_karyo 逐日彩色散点
+          try(plot_karyotype_colored_scatter_for_sim(csv_dir, file.path(sim, "png_karyo")), silent = TRUE)
+          invisible(TRUE)
+        }
+
+        need_local_plan <- FALSE
+        if (future::nbrOfWorkers() <= 1L) {
+          need_local_plan <- TRUE
+          future::plan(future::multisession, workers = max(1L, parallel::detectCores() - 2L))
+        }
+        on.exit({ if (need_local_plan) future::plan(future::sequential) }, add = TRUE)
+
+        future.apply::future_lapply(sims_all, .process_one_sim, future.seed = TRUE)
+      }
+    }
+  }
+  invisible(TRUE)
 }
 
 #
 # ---- (1b-1) Boxplot + mean line (faceted by supply) ----
 plot_diversity_boxplots <- function(div_all, out_path = NULL) {
-    if (nrow(div_all) == 0) return(invisible(NULL))
-   # Only keep Entropy and bin by 30 days
+  if (nrow(div_all) == 0) return(invisible(NULL))
+  # Only keep Entropy and bin by 30 days
   long <- div_all %>%
     select(day, supply, Entropy) %>%
     mutate(
@@ -114,13 +215,16 @@ plot_diversity_boxplots <- function(div_all, out_path = NULL) {
   p <- ggplot(long, aes(x = day_bin_label, y = value, group = day_bin_label)) +
     geom_boxplot(outlier.size = 0.7, width = 0.6, alpha = 0.85) +
     stat_summary(fun = mean, geom = "line", aes(group = 1), linewidth = 1) +
-      facet_grid(supply ~ ., scales = "free_y") +
-      coord_cartesian(ylim = c(0, 1.5)) +
+    facet_grid(supply ~ ., scales = "free_y") +
+    coord_cartesian(ylim = c(0, 1.5)) +
     labs(x = "Day bin (30 days)", y = "Entropy (Shannon)",
          title = "Entropy over time across replicates (30-day bins)") +
     theme_bw()+
     theme(axis.text.x = element_text(angle = 45, hjust = 1))
-  if (!is.null(out_path)) ggsave(out_path, p, width = 12, height = 8, device = cairo_pdf)
+  if (!is.null(out_path)) {
+    max_day <- max(long$day, na.rm = TRUE)
+    ggsave(out_path, p, width = 12 * max_day / 720, height = 8, device = cairo_pdf)
+  }
   p
 }
 # ---- (1b-2) Boxplot + mean line for Simpson index (faceted by supply, 30-day bins) ----
@@ -148,14 +252,20 @@ plot_diversity_boxplots_simpson <- function(div_all, out_path = NULL) {
          title = "Simpson diversity over time across replicates (30-day bins)") +
     theme_bw()+
     theme(axis.text.x = element_text(angle = 45, hjust = 1))
-  if (!is.null(out_path)) ggsave(out_path, p, width = 12, height = 8, device = cairo_pdf)
+  if (!is.null(out_path)) {
+    max_day <- max(long$day, na.rm = TRUE)
+    ggsave(out_path, p, width = 12 * max_day / 720, height = 8, device = cairo_pdf)
+  }
   p
 }
 #
 # ---- (2) G distribution over time for a single simulation: violin plot ----
 plot_G_violin_for_sim <- function(csv_dir, out_path, sample_cells = 5000) {
   files <- .list_daily_files(csv_dir)
-  if (length(files) == 0) return(invisible(NULL))
+  if (length(files) == 0) {
+    message("[plot_G_violin_for_sim] No daily snapshots under ", csv_dir, "; skipping.")
+    return(invisible(NULL))
+  }
   g_tbl <- purrr::map_dfr(files, function(f) {
     day <- .parse_day(f)
     df <- .read_daily_file(f)
@@ -198,7 +308,8 @@ plot_G_violin_for_sim <- function(csv_dir, out_path, sample_cells = 5000) {
          title = "Distribution of G over time (30-day bins, per simulation)") +
     theme_bw()+
     theme(axis.text.x = element_text(angle = 45, hjust = 1))
-  ggsave(out_path, p, width = 10, height = 5)
+  max_day <- max(g_tbl$day, na.rm = TRUE)
+  ggsave(out_path, p, width = 10 * max_day / 720, height = 5)
   p
 }
 
@@ -209,8 +320,22 @@ plot_karyotype_colored_scatter_for_sim <- function(csv_dir, out_dir) {
   files <- files[order(.parse_day(files))]
   dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 
+  # Detect MSR label from path: Results/MSR_<val>/<supply>/Sim_xxx/csv
+  msr_label <- NA_character_
+  sim_dir <- dirname(csv_dir)
+  supply_dir <- dirname(sim_dir)
+  msr_dir <- dirname(supply_dir)
+  bd <- basename(msr_dir)
+  if (grepl("^MSR_", bd)) msr_label <- sub("^MSR_", "", bd)
+
   # Build karyotype color palette
   all_kt_levels <- compute_all_karyotypes_for_sim(csv_dir)
+  
+  if (length(all_kt_levels) == 0) {
+    message("[plot_karyotype_colored_scatter_for_sim] No karyotypes found under ", csv_dir, "; skipping.")
+    return(invisible(NULL))
+  }
+
   kcols <- .build_karyotype_palette_distinct(all_kt_levels)
   col_norm <- "#D3D3D3"  # light gray for normal
 
@@ -248,8 +373,12 @@ plot_karyotype_colored_scatter_for_sim <- function(csv_dir, out_dir) {
     op <- par(mar = c(0,0,0,0), pty = "s")
     plot(NA, xlim = c(1, xmax), ylim = c(1, ymax), axes = FALSE, xlab = "", ylab = "", asp = 1)
     points(df$X, df$Y, pch = 16, cex = 1.5, col = col_vec)
-    mtext(sprintf("Tumor karyotypes (colored) / normals (gray)  Day:%d", day),
-          side = 3, line = -1.5, adj = 0, cex = 1.2)
+    ttl <- if (!is.na(msr_label)) {
+      sprintf("MSR: %s  Tumor karyotypes (colored) / normals (gray)  Day:%d", msr_label, day)
+    } else {
+      sprintf("Tumor karyotypes (colored) / normals (gray)  Day:%d", day)
+    }
+    mtext(ttl, side = 3, line = -1.5, adj = 0, cex = 1.2)
     par(op); dev.off()
   }
   invisible(TRUE)
@@ -283,6 +412,10 @@ compute_karyotype_proportions <- function(csv_dir, top_n = 12) {
 }
 
 plot_karyotype_stream_for_sim <- function(csv_dir, out_path) {
+  if (!exists("compute_karyotype_union99_props", mode = "function")) {
+    message("[plot_karyotype_stream_for_sim] compute_karyotype_union99_props() not found; skipping.")
+    return(invisible(NULL))
+  }
   prop_tbl <- compute_karyotype_union99_props(csv_dir)
   if (nrow(prop_tbl) == 0) return(invisible(NULL))
 
@@ -507,68 +640,6 @@ plot_karyotype_counts_funnel_for_sim <- function(csv_dir, out_path) {
 }
 
 
-#
-# ---- Orchestrators ----
-# 1) Merge all supplies/simulations: diversity boxplot + mean line
-run_diversity_analysis_all <- function(base_output) {
-  results_root <- file.path(base_output, "Results")
-  div_all <- collect_diversity_across_results(results_root)
-  out_pdf <- file.path(results_root, "diversity_boxplots_by_supply_Entroy.pdf")
-  plot_diversity_boxplots(div_all, out_pdf)
-  out_pdf_simpson <- file.path(results_root, "diversity_boxplots_by_supply_Simpson.pdf")
-  plot_diversity_boxplots_simpson(div_all, out_pdf_simpson)
-  invisible(div_all)
-}
-
-#
-# 2) Single simulation plots: G violin plot & karyotype stacked area plot (one plot per simulation)
-run_per_sim_plots <- function(base_output, sample_cells = 5000) {
-  results_root <- file.path(base_output, "Results")
-  supply_dirs <- list.dirs(results_root, full.names = TRUE, recursive = FALSE)
-  purrr::walk(supply_dirs, function(sup) {
-    sim_dirs <- list.dirs(sup, full.names = TRUE, recursive = FALSE)
-    purrr::walk(sim_dirs, function(sim) {
-      csv_dir <- file.path(sim, "csv")
-      if (!dir.exists(csv_dir)) return(NULL)
-      out_dir <- file.path(sim, "analysis")
-      dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
-
-      # (2) G violin
-      plot_G_violin_for_sim(csv_dir, file.path(out_dir, "G_violin_over_time.pdf"),
-                            sample_cells = sample_cells)
-      # (2b) Daily scatter with fixed karyotype colors → png_karyo
-      out_karyo_png <- file.path(sim, "png_karyo")
-      plot_karyotype_colored_scatter_for_sim(csv_dir, out_karyo_png)
-      # (3a) Karyotype stacked area using union of daily Top-k covering ≥99% and fixed colors
-      plot_karyotype_stream_for_sim(csv_dir,
-      file.path(out_dir, "Karyotype_stream_union99.pdf"))
-      # (3b) Karyotype counts symmetric funnel (tumor-only, union of >99% share per day)
-      plot_karyotype_counts_funnel_for_sim(csv_dir,
-        file.path(out_dir, "Karyotype_counts_funnel_union99.pdf"))
-    })
-  })
-  invisible(TRUE)
-}
-
-
-# ---- High-level orchestrator (single-call entrypoint) ----
-# Runs both analyses by default:
-#  - Across-replicate diversity boxplots with mean line
-#  - Per-simulation G violin and karyotype stacked area plots
-run_diversity_timeseries <- function(base_output,
-                                     sample_cells = 5000,
-                                     do_diversity = TRUE,
-                                     do_per_sim  = TRUE) {
-  stopifnot(is.character(base_output), length(base_output) == 1)
-  if (isTRUE(do_diversity)) {
-    run_diversity_analysis_all(base_output)
-  }
-  if (isTRUE(do_per_sim)) {
-  run_per_sim_plots(base_output,
-                    sample_cells = sample_cells)
-  }
-  invisible(TRUE)
-}
 
 # ---- Example usage (uncomment to run directly) ----
 # base_output <- "/Users/4482173/Documents/Project/GBM_Model"

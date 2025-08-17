@@ -438,7 +438,7 @@ run_simulation_cfg <- function(cfg, karyolib, outputdir, prefix = "Cells", globa
 }
 
 # ----------------------- Batch runner from YAML -----------------------
-run_ABM_simulation <- function(cfg_file, karyolib_file, base_output, workers = max(1, parallel::detectCores() - 1)) {
+run_ABM_simulation <- function(cfg_file, karyolib_file, base_output, workers = max(1, parallel::detectCores() - 2)) {
   cfg0 <- read_config(cfg_file)
   karyolib <- read_karyolib(karyolib_file)
   cfg0$Fd <- karyolib$fitness[match(kt_vec2str(rep(2L, 22)), karyolib$karyotype)]

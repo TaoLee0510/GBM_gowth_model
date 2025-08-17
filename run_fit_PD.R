@@ -1,6 +1,6 @@
 base_output <- "/Volumes/Protable Disk/Project/GBM/ABM"
 
-source("/Users/4482173/Documents/GitHub/GBM_gowth_model/fit_PD.R")
+source("/Users/taolee/Documents/GitHub/GBM_gowth_model/fit_PD.R")
 #
 # 1) Fit all simulations under a specific supply together:
 fit_PD_from_results(file.path(base_output, "Results"),
@@ -33,12 +33,12 @@ summarize_PD_all(
 # ---- Diversity time series analysis ----
 # This script orchestrates the diversity analysis and per-simulation plots.
 # ---- Diversity & Time-Series Analysis (single call) ----
-source("/Users/4482173/Documents/GitHub/GBM_gowth_model/Diversity_TimeSeries_Analysis.R")
+source("/Users/taolee/Documents/GitHub/GBM_gowth_model/Diversity_TimeSeries_Analysis.R")
 base_output <- "/Volumes/Protable Disk/Project/GBM/ABM"
 run_diversity_timeseries(
   base_output = base_output,
   sample_cells = Inf,
-  do_diversity = FALSE,
+  do_diversity = TRUE,
   do_per_sim  = TRUE
 )
 
