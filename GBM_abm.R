@@ -38,7 +38,20 @@ read_config <- function(path) {
   cfg_raw$m   <- as.numeric(cfg_raw$m)
   cfg_raw$N_death_rate <- as.numeric(cfg_raw$N_death_rate)
   cfg_raw$T_death_rate <- as.numeric(cfg_raw$T_death_rate)
-  cfg_raw$MSR <- as.numeric(cfg_raw$MSR)
+  # MSR: accept scalar, numeric vector, or comma-separated string; normalize to vector
+  msr_raw <- cfg_raw$MSR
+  if (is.null(msr_raw)) {
+    msr_vec <- 1.0
+  } else if (is.numeric(msr_raw) && length(msr_raw) > 1) {
+    msr_vec <- as.numeric(msr_raw)
+  } else if (is.character(msr_raw) && length(msr_raw) == 1 && grepl(",", msr_raw)) {
+    parts <- strsplit(msr_raw, ",")[[1]]
+    msr_vec <- as.numeric(trimws(parts))
+  } else {
+    msr_vec <- as.numeric(msr_raw)
+  }
+  cfg_raw$MSR_vec <- msr_vec
+  cfg_raw$MSR <- as.numeric(msr_vec[1])
   cfg_raw$radius <- as.numeric(cfg_raw$radius)
   cfg_raw$CooldownFactor <- as.numeric(cfg_raw$CooldownFactor %||% 5)
   # Parse total_supply as vector: accept numeric, YAML seq, or comma-separated string
@@ -223,11 +236,29 @@ run_simulation_cfg <- function(cfg, karyolib, outputdir, prefix = "Cells", globa
   dir.create(file.path(outputdir, "csv"), showWarnings = FALSE, recursive = TRUE)
   dir.create(file.path(outputdir, "png"), showWarnings = FALSE, recursive = TRUE)
   arrow::write_parquet(
-  Cells,
-  sprintf(paste0(outputdir, "/csv/%s_day%03d.parquet"), prefix, day_index),
-  compression = "zstd", compression_level = 3
-)
+    Cells,
+    sprintf(paste0(outputdir, "/csv/%s_day%03d.parquet"), prefix, day_index),
+    compression = "zstd", compression_level = 3
+  )
   cat("Day", day_index, ":", sum(Cells$Status==1L), "living cells saved\n")
+
+  # Also save Day 0 PNG snapshot (matching the 24h snapshots)
+  png_path0 <- sprintf(paste0(outputdir, "/png/%s_day%03d.png"), prefix, day_index)
+  png(filename = png_path0, width = 1000, height = 1000, units = "px")
+  op <- par(mar = c(0, 0, 0, 0), oma = c(0, 0, 2, 0), pty = "s")
+  plot(NA, xlim = c(1, cfg$N), ylim = c(1, cfg$N), axes = FALSE, xlab = "", ylab = "", asp = 1)
+  if (nrow(Cells) > 0) {
+    idx_norm <- which(Cells$Label == 0L & Cells$Status == 1L)
+    idx_tum  <- which(Cells$Label == 1L & Cells$Status == 1L)
+    if (length(idx_norm)) points(Cells$X[idx_norm], Cells$Y[idx_norm], pch = 16, cex = 1.5, col = "green")
+    if (length(idx_tum))  points(Cells$X[idx_tum],  Cells$Y[idx_tum],  pch = 16, cex = 1.5, col = "red")
+  }
+  title_txt0 <- sprintf("MSR: %s   total supply factor: %s  Day:%d",
+                       format(signif(cfg$MSR, 6), trim = TRUE),
+                       format(signif(cfg$total_supply / (cfg$N * cfg$N), 6), trim = TRUE),
+                       day_index)
+  mtext(title_txt0, side = 3, line = 0.5, adj = 0, outer = TRUE, cex = 1.2)
+  par(op); dev.off()
 
   # Build K matrix once (will be replaced by C++ returns after each hour)
   k_cols <- paste0("K", 1:22)
@@ -373,8 +404,9 @@ run_simulation_cfg <- function(cfg, karyolib, outputdir, prefix = "Cells", globa
         if (length(idx_norm)) points(Cells_live$X[idx_norm], Cells_live$Y[idx_norm], pch = 16, cex = 1.5, col = "green")
         if (length(idx_tum))  points(Cells_live$X[idx_tum],  Cells_live$Y[idx_tum],  pch = 16, cex = 1.5, col = "red")
       }
-      # Build title "total_supply: XX  Day:XX" with left alignment; use supply ratio for XX
-      title_txt <- sprintf("total supply factor: %s  Day:%d",
+      # Build title with MSR and total supply factor and day
+      title_txt <- sprintf("MSR: %s   total supply factor: %s  Day:%d",
+                           format(signif(cfg$MSR, 6), trim = TRUE),
                            format(signif(cfg$total_supply / (cfg$N * cfg$N), 6), trim = TRUE),
                            day_index)
       mtext(title_txt, side = 3, line = 0.5, adj = 0, outer = TRUE, cex = 1.2)
@@ -406,7 +438,7 @@ run_simulation_cfg <- function(cfg, karyolib, outputdir, prefix = "Cells", globa
 }
 
 # ----------------------- Batch runner from YAML -----------------------
-run_ABM_simulation <- function(cfg_file, karyolib_file, base_output, workers = max(1, parallel::detectCores() - 1)) {
+run_ABM_simulation <- function(cfg_file, karyolib_file, base_output, workers = max(1, parallel::detectCores() - 2)) {
   cfg0 <- read_config(cfg_file)
   karyolib <- read_karyolib(karyolib_file)
   cfg0$Fd <- karyolib$fitness[match(kt_vec2str(rep(2L, 22)), karyolib$karyotype)]
@@ -415,35 +447,46 @@ run_ABM_simulation <- function(cfg_file, karyolib_file, base_output, workers = m
   supplies <- cfg0$total_supply_vec
   reps <- cfg0$replicates
 
-  # Prepare all jobs (supply x replicate) with simulation index reset per supply
   jobs <- list()
-  for (s in supplies) {
-    supply_label <- format(signif(s / (cfg0$N * cfg0$N), 6), trim = TRUE)
-    # reset counter per supply
-    for (r in seq_len(reps)) {
-      out_dir <- file.path(base_output, "Results", supply_label, sprintf("Sim_%03d", r))
-      cfg_i <- cfg0
-      cfg_i$total_supply <- s
-      jobs[[length(jobs)+1L]] <- list(
-        cfg = cfg_i,
-        out_dir = out_dir,
-        prefix = sprintf("Cells_supply_%s_rep%03d", gsub("[^0-9.]", "", supply_label), r),
-        cfg_path = cfg_file,
-        karyolib_path = karyolib_file,
-        global_id = as.integer(r)  # within-supply replicate id (001..reps)
-      )
+  msrs <- cfg0$MSR_vec %||% 1.0
+  for (msr in msrs) {
+    msr_label <- format(signif(msr, 6), trim = TRUE)
+    for (s in supplies) {
+      supply_label <- format(signif(s / (cfg0$N * cfg0$N), 6), trim = TRUE)
+      for (r in seq_len(reps)) {
+        out_dir <- file.path(base_output, "Results",
+                             sprintf("MSR_%s", gsub("[^0-9.]+", "", msr_label)),
+                             supply_label,
+                             sprintf("Sim_%03d", r))
+        cfg_i <- cfg0
+        cfg_i$total_supply <- s
+        cfg_i$MSR <- msr
+        jobs[[length(jobs) + 1L]] <- list(
+          cfg = cfg_i,
+          out_dir = out_dir,
+          prefix = sprintf("Cells_supply_%s_rep%03d",
+                            gsub("[^0-9.]", "", supply_label), r),
+          cfg_path = cfg_file,
+          karyolib_path = karyolib_file,
+          global_id = as.integer(r),
+          msr_label = msr_label,
+          supply_label = supply_label
+        )
+      }
     }
   }
 
-  # Create a manifest to verify mapping (supply x replicate -> folder/prefix)
+  # Create a manifest to verify mapping (MSR x supply x replicate -> folder/prefix)
   results_root <- file.path(base_output, "Results")
   dir.create(results_root, recursive = TRUE, showWarnings = FALSE)
   if (length(jobs) > 0) {
     manifest <- tibble::tibble(
+      msr_value    = vapply(jobs, function(j) j$cfg$MSR, numeric(1)),
+      msr_label    = vapply(jobs, function(j) j$msr_label, character(1)),
       supply_mode  = vapply(jobs, function(j) j$cfg$supply_mode, character(1)),
       supply_value = vapply(jobs, function(j) j$cfg$total_supply, numeric(1)),
       supply_ratio = vapply(jobs, function(j) j$cfg$total_supply / (cfg0$N * cfg0$N), numeric(1)),
-      supply_label = vapply(jobs, function(j) basename(dirname(j$out_dir)), character(1)),
+      supply_label = vapply(jobs, function(j) j$supply_label, character(1)),
       CooldownFactor = vapply(jobs, function(j) j$cfg$CooldownFactor, numeric(1)),
       suggested_use = vapply(jobs, function(j) {
         switch(tolower(j$cfg$supply_mode),
