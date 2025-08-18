@@ -212,14 +212,19 @@ plot_diversity_boxplots <- function(div_all, out_path = NULL) {
                              levels = unique(day_bin_label[order(day_bin)]))
     )
 
+  # Compute a global max across all facets and add a small headroom
+  y_max <- suppressWarnings(max(long$value, na.rm = TRUE))
+  if (!is.finite(y_max)) y_max <- 1.5
+  y_max <- y_max * 1.05
+
   p <- ggplot(long, aes(x = day_bin_label, y = value, group = day_bin_label)) +
     geom_boxplot(outlier.size = 0.7, width = 0.6, alpha = 0.85) +
     stat_summary(fun = mean, geom = "line", aes(group = 1), linewidth = 1) +
     facet_grid(supply ~ ., scales = "free_y") +
-    coord_cartesian(ylim = c(0, 1.5)) +
+    coord_cartesian(ylim = c(0, y_max)) +
     labs(x = "Day bin (30 days)", y = "Entropy (Shannon)",
          title = "Entropy over time across replicates (30-day bins)") +
-    theme_bw()+
+    theme_bw() +
     theme(axis.text.x = element_text(angle = 45, hjust = 1))
   if (!is.null(out_path)) {
     max_day <- max(long$day, na.rm = TRUE)
@@ -243,14 +248,19 @@ plot_diversity_boxplots_simpson <- function(div_all, out_path = NULL) {
                              levels = unique(day_bin_label[order(day_bin)]))
     )
 
+  # Compute a global max across all facets and add a small headroom
+  y_max <- suppressWarnings(max(long$value, na.rm = TRUE))
+  if (!is.finite(y_max)) y_max <- 1.5
+  y_max <- y_max * 1.05
+
   p <- ggplot(long, aes(x = day_bin_label, y = value, group = day_bin_label)) +
     geom_boxplot(outlier.size = 0.7, width = 0.6, alpha = 0.85) +
     stat_summary(fun = mean, geom = "line", aes(group = 1), linewidth = 1) +
     facet_grid(supply ~ ., scales = "free_y") +
-    coord_cartesian(ylim = c(0, 1.5)) +
+    coord_cartesian(ylim = c(0, y_max)) +
     labs(x = "Day bin (30 days)", y = "Simpson diversity (1 - λ)",
          title = "Simpson diversity over time across replicates (30-day bins)") +
-    theme_bw()+
+    theme_bw() +
     theme(axis.text.x = element_text(angle = 45, hjust = 1))
   if (!is.null(out_path)) {
     max_day <- max(long$day, na.rm = TRUE)

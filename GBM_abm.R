@@ -450,14 +450,15 @@ run_ABM_simulation <- function(cfg_file, karyolib_file, base_output, workers = m
   jobs <- list()
   msrs <- cfg0$MSR_vec %||% 1.0
   for (msr in msrs) {
-    msr_label <- format(signif(msr, 6), trim = TRUE)
+    msr_label_print <- format(msr, scientific = FALSE, trim = TRUE, digits = 15)
+    msr_label_dir   <- gsub("[^0-9.\\-]", "", msr_label_print) 
     for (s in supplies) {
-      supply_label <- format(signif(s / (cfg0$N * cfg0$N), 6), trim = TRUE)
+      supply_label <- format(s / (cfg0$N * cfg0$N), scientific = FALSE, trim = TRUE, digits = 15)
       for (r in seq_len(reps)) {
         out_dir <- file.path(base_output, "Results",
-                             sprintf("MSR_%s", gsub("[^0-9.]+", "", msr_label)),
-                             supply_label,
-                             sprintf("Sim_%03d", r))
+                              sprintf("MSR_%s", msr_label_dir),
+                              supply_label,
+                              sprintf("Sim_%03d", r))
         cfg_i <- cfg0
         cfg_i$total_supply <- s
         cfg_i$MSR <- msr
@@ -469,7 +470,7 @@ run_ABM_simulation <- function(cfg_file, karyolib_file, base_output, workers = m
           cfg_path = cfg_file,
           karyolib_path = karyolib_file,
           global_id = as.integer(r),
-          msr_label = msr_label,
+          msr_label = msr_label_print,
           supply_label = supply_label
         )
       }
